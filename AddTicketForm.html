@@ -1,0 +1,750 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+  <style>
+    body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; padding: 15px; background-color: #f9f9f9; }
+    h2 { color: #333; border-bottom: 2px solid #eee; padding-bottom: 5px; }
+    form { background-color: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+    label { display: block; margin-top: 12px; font-weight: 600; color: #555; font-size: 0.9em; }
+    input[type="text"], input[type="date"], input[type="time"], input[type="number"], textarea, select {
+      width: 100%; padding: 8px; margin-top: 4px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; font-size: 0.95em;
+    }
+    textarea { min-height: 60px; resize: vertical; }
+    button { margin-top: 20px; padding: 12px 20px; width: 100%; background-color: #007bff; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 1em; transition: background-color 0.2s; }
+    button:hover { background-color: #0056b3; }
+    button:disabled { background-color: #ccc !important; color: #666 !important; cursor: not-allowed; }
+    #status { margin-top: 15px; color: blue; font-weight: bold; text-align: center; min-height: 1.2em; }
+    #ocrOverrideWarning { display: none; color: #ff9800; margin-top: 8px; font-size: 0.85em; text-align: center; }
+
+    /* Drag & Drop Zone */
+    #dropZone { border: 2px dashed #007bff; border-radius: 5px; padding: 25px; text-align: center; margin-bottom: 15px; background-color: #f0f8ff; transition: background-color 0.3s, border-color 0.3s; }
+    #dropZone p { margin: 0; color: #555; }
+    #dropZone.dragover { background-color: #e0f0ff; border-color: #0056b3; }
+
+    /* Progress Bar Styles */
+    .progress-bar-container { display: none; margin-top: 15px; border: 1px solid #ccc; border-radius: 5px; overflow: hidden; background-color: #fff; }
+    .progress-stage { padding: 10px 15px; border-bottom: 1px solid #eee; background-color: #f9f9f9; color: #888; transition: all 0.3s ease-in-out; font-size: 0.9em; }
+    .progress-stage:last-child { border-bottom: none; }
+    .progress-stage.pending { color: #aaa; }
+    .progress-stage.active { background-color: #e7f0fe; color: #3367d6; font-weight: bold; }
+    .progress-stage.complete { background-color: #e6f4ea; color: #137333; }
+    .progress-stage.error { background-color: #fce8e6; color: #a50e0e; }
+    .progress-stage i { margin-right: 10px; width: 1.3em; text-align: center;}
+    .fa-spinner { animation: spin 1s linear infinite; }
+    @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+
+    /* Input Highlighting */
+    .auto-detected { background-color: #e8f4e8 !important; border-color: #c3e6cb !important; }
+    .overridden { background-color: #fff3cd !important; border-color: #ffeeba !important; }
+
+    /* Input Grouping */
+    .form-row { display: flex; gap: 15px; margin-top: 10px; }
+    .form-group { flex: 1; }
+    .form-group label { margin-top: 0; } /* Reset margin for grouped labels */
+
+  </style>
+</head>
+<body>
+  <h2>Process Parking/Traffic Ticket</h2>
+  <form id="ticketForm">
+
+    <label for="ticketPDFFile">Ticket PDF Document:</label>
+    <div id="dropZone">
+      <p><i class="fas fa-file-pdf"></i> Drag & drop PDF here or click to browse</p>
+      <input type="file" id="ticketPDFFile" name="ticketPDFFile" accept="application/pdf" style="display: none;" onchange="handleFileSelect(event)" />
+    </div>
+    <div id="uploadStatus" style="margin-top: -10px; margin-bottom: 10px; font-size: 0.85em; text-align: center;"></div>
+
+    <!-- Progress Bar -->
+    <div id="progressBarContainer" class="progress-bar-container">
+      <div id="progressUpload" class="progress-stage pending">
+        <i class="fas fa-cloud-upload-alt"></i> Uploading Ticket...
+      </div>
+      <div id="progressAnalyze" class="progress-stage pending">
+        <i class="fas fa-search"></i> Analyzing Ticket (OCR)...
+      </div>
+      <div id="progressPopulate" class="progress-stage pending">
+        <i class="fas fa-edit"></i> Populating Form...
+      </div>
+    </div>
+    <!-- END Progress Bar -->
+    <!-- ... (after progress bar) ... -->
+
+    <!-- Hidden fields for multi-violation handling -->
+    <input type="hidden" id="currentViolationIndex" name="currentViolationIndex" value="0">
+    <input type="hidden" id="isLateNotice" name="isLateNotice" value="false">
+    <!-- We'll store the full data in JS, not a hidden field -->
+
+    <!-- Multi-violation Info & Navigation -->
+    <div id="multiViolationInfo" style="display: none; background-color: #fff3cd; border: 1px solid #ffeeba; padding: 10px; margin-bottom: 15px; border-radius: 4px; text-align: center;">
+      <span id="multiViolationText"></span>
+      <div id="multiViolationNav" style="margin-top: 8px;">
+        <button type="button" id="prevViolationBtn" onclick="changeViolation(-1)" style="width: auto; padding: 5px 10px; margin: 0 5px; background-color: #6c757d;">< Previous</button>
+        <span id="violationIndicator" style="font-weight: bold;"></span>
+        <button type="button" id="nextViolationBtn" onclick="changeViolation(1)" style="width: auto; padding: 5px 10px; margin: 0 5px; background-color: #6c757d;">Next ></button>
+      </div>
+    </div>
+
+    <div id="ocrOverrideWarning">Heads up! You've manually changed some auto-detected values.</div>
+
+    <!-- Hidden fields for internal use -->
+    <input type="hidden" id="ticketPDF" name="ticketPDF">
+    <input type="hidden" id="ticketFileId" name="ticketFileId">
+
+    <!-- Form Rows (License Plate, Date, etc.) -->
+    <!-- ... (rest of your existing form fields) ... -->
+    <div id="ocrOverrideWarning">Heads up! You've manually changed some auto-detected values.</div>
+
+    <!-- Hidden fields for internal use -->
+    <input type="hidden" id="ticketPDF" name="ticketPDF">
+    <input type="hidden" id="ticketFileId" name="ticketFileId">
+
+    <!-- OCR Extracted Fields -->
+    <div class="form-row">
+      <div class="form-group">
+        <label for="licensePlate">License Plate (B*):</label>
+        <input type="text" id="licensePlate" name="licensePlate" required oninput="markOverridden(this)">
+      </div>
+      <div class="form-group">
+        <label for="licensePlateState">License Plate State (C*):</label>
+        <input type="text" id="licensePlateState" name="licensePlateState" required oninput="markOverridden(this)">
+      </div>
+    </div>
+
+    <div class="form-row">
+      <div class="form-group">
+        <label for="violationDate">Violation Date (D*):</label>
+        <input type="date" id="violationDate" name="violationDate" required oninput="markOverridden(this)">
+      </div>
+      <div class="form-group">
+        <label for="violationTime">Violation Time (E*):</label>
+        <input type="time" id="violationTime" name="violationTime" required step="1" oninput="markOverridden(this)">
+         <!-- step="1" allows seconds if available -->
+      </div>
+    </div>
+
+    <div class="form-row">
+      <div class="form-group">
+        <label for="violationId">Violation ID # (F*):</label>
+        <input type="text" id="violationId" name="violationId" required oninput="markOverridden(this)">
+      </div>
+      <div class="form-group">
+        <label for="pinNumber">PIN number (if available) (G*):</label>
+        <input type="text" id="pinNumber" name="pinNumber" oninput="markOverridden(this)">
+      </div>
+    </div>
+
+    <label for="issuingAgency">Issuing Agency (H*):</label>
+    <input type="text" id="issuingAgency" name="issuingAgency" required oninput="markOverridden(this)">
+
+    <label for="violationType">Violation Type (I*):</label>
+    <input type="text" id="violationType" name="violationType" required oninput="markOverridden(this)">
+
+    <label for="violationLocation">Violation Location (J*):</label>
+    <textarea id="violationLocation" name="violationLocation" required oninput="markOverridden(this)"></textarea>
+
+    <div class="form-row">
+      <div class="form-group">
+        <label for="originalPenalty">Original Billable Penalty ($) (Q*):</label>
+        <input type="number" step="0.01" id="originalPenalty" name="originalPenalty" required oninput="markOverridden(this)">
+      </div>
+      <div class="form-group">
+        <label for="additionalPenalty">Add'l Penalty ($) (if applicable) (R*):</label>
+        <input type="number" step="0.01" id="additionalPenalty" name="additionalPenalty" oninput="markOverridden(this)">
+      </div>
+    </div>
+
+    <label for="notes">Notes (Website for payment, etc.) (T*):</label>
+    <textarea id="notes" name="notes" oninput="markOverridden(this)"></textarea>
+
+    <label for="dueDate">Due date (if available) (U*):</label>
+    <input type="date" id="dueDate" name="dueDate" oninput="markOverridden(this)">
+
+    <!-- End OCR Fields -->
+
+    <div id="status"></div>
+    <button type="button" id="submitBtn" onclick="submitTicket()" disabled>Submit Ticket Data</button>
+
+  </form>
+
+    <script>
+    // --- Global Variables for Form State ---
+    let allViolationsData = []; // To store the array of violations
+    let currentViolationIndex = 0;
+
+    // --- DOM Element References (Define these EARLY) ---
+    const form = document.getElementById('ticketForm');
+    const dropZone = document.getElementById('dropZone');
+    const fileInput = document.getElementById('ticketPDFFile');
+    const uploadStatus = document.getElementById('uploadStatus');
+    const progressBarContainer = document.getElementById('progressBarContainer');
+    const submitBtn = document.getElementById('submitBtn');
+    const statusDiv = document.getElementById('status');
+    const ocrWarningDiv = document.getElementById('ocrOverrideWarning');
+    // Add any other top-level element constants here if needed (e.g., multi-violation elements)
+    const multiInfoDiv = document.getElementById('multiViolationInfo');
+    const multiTextSpan = document.getElementById('multiViolationText');
+    const multiNavDiv = document.getElementById('multiViolationNav');
+    const prevViolationBtn = document.getElementById('prevViolationBtn');
+    const nextViolationBtn = document.getElementById('nextViolationBtn');
+    const violationIndicator = document.getElementById('violationIndicator');
+
+
+    // *** NEW HELPER FUNCTIONS FOR FRONTEND PARSING ***
+
+    /**
+     * Parses various date string formats (from Gemini) into YYYY-MM-DD format for <input type="date">.
+     * @param {string} dateString The raw date string (e.g., "MM/DD/YYYY", "YYYY-MM-DD", "MM/DD/YY").
+     * @returns {string|null} The date in YYYY-MM-DD format, or null if parsing fails.
+     */
+    function parseDateForInput(dateString) {
+        if (!dateString || typeof dateString !== 'string') return null;
+        dateString = dateString.trim();
+        let year, month, day;
+
+        try {
+            // Try YYYY-MM-DD
+            let match = dateString.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+            if (match) {
+                year = parseInt(match[1]);
+                month = parseInt(match[2]);
+                day = parseInt(match[3]);
+            }
+            // Try MM/DD/YYYY
+            else if ((match = dateString.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/))) {
+                year = parseInt(match[3]);
+                month = parseInt(match[1]);
+                day = parseInt(match[2]);
+            }
+            // Try MM/DD/YY (assume 20xx)
+            else if ((match = dateString.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2})$/))) {
+                year = parseInt(match[3]) + 2000;
+                month = parseInt(match[1]);
+                day = parseInt(match[2]);
+            }
+            // Add other formats if needed
+
+            if (year && month && day) {
+                // Basic validation (can be improved)
+                if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+                // Format to YYYY-MM-DD with zero padding
+                const formattedMonth = month.toString().padStart(2, '0');
+                const formattedDay = day.toString().padStart(2, '0');
+                return `${year}-${formattedMonth}-${formattedDay}`;
+            } else {
+                console.warn(`Could not parse date string "${dateString}" for input.`);
+                return null; // Parsing failed
+            }
+        } catch (e) {
+            console.error(`Error parsing date string "${dateString}" for input:`, e);
+            return null;
+        }
+    }
+
+    /**
+     * Parses various time string formats (from Gemini) into HH:MM:SS format for <input type="time">.
+     * @param {string} timeString The raw time string (e.g., "HH:MM:SS", "HH:MM", "h:mm A/PM").
+     * @returns {string|null} The time in HH:MM:SS (24-hour) format, or null if parsing fails.
+     */
+    function parseTimeForInput(timeString) {
+        if (!timeString || typeof timeString !== 'string') return null;
+        timeString = timeString.trim().toUpperCase(); // Normalize case for AM/PM
+        let hours = null, minutes = null, seconds = 0; // Default seconds to 0
+        let match;
+
+        try {
+            // Try HH:MM:SS (24hr)
+            match = timeString.match(/^(\d{1,2}):(\d{2}):(\d{2})$/);
+            if (match) {
+                hours = parseInt(match[1]);
+                minutes = parseInt(match[2]);
+                seconds = parseInt(match[3]);
+            }
+            // Try HH:MM (24hr)
+            else if ((match = timeString.match(/^(\d{1,2}):(\d{2})$/))) {
+                hours = parseInt(match[1]);
+                minutes = parseInt(match[2]);
+                // seconds remains 0
+            }
+            // Try h:mm[ ]A/PM or hh:mm[ ]A/PM (optional seconds handled later if needed, assume 0 for now)
+            else if ((match = timeString.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?\s*([AP]M)$/))) {
+                 hours = parseInt(match[1]);
+                 minutes = parseInt(match[2]);
+                 seconds = match[3] ? parseInt(match[3]) : 0; // Capture seconds if present
+                 const ampm = match[4];
+
+                 if (ampm === "PM" && hours !== 12) hours += 12;
+                 if (ampm === "AM" && hours === 12) hours = 0; // Midnight case
+            }
+            // Add other formats if needed
+
+            // Validate and format
+            if (hours !== null && minutes !== null &&
+                hours >= 0 && hours <= 23 &&
+                minutes >= 0 && minutes <= 59 &&
+                seconds >= 0 && seconds <= 59) {
+                // Format to HH:MM:SS with zero padding
+                const formattedHours = hours.toString().padStart(2, '0');
+                const formattedMinutes = minutes.toString().padStart(2, '0');
+                const formattedSeconds = seconds.toString().padStart(2, '0');
+                return `${formattedHours}:${formattedMinutes}:${formattedSeconds}`;
+            } else {
+                 console.warn(`Could not parse time string "${timeString}" for input.`);
+                 return null; // Parsing failed
+            }
+        } catch (e) {
+            console.error(`Error parsing time string "${timeString}" for input:`, e);
+            return null;
+        }
+    }
+
+    // *** END NEW HELPER FUNCTIONS ***
+
+
+    // --- Main Form Logic Functions ---
+
+     /**
+      * Populates the form fields with data from the specified violation index.
+      * @param {number} index The index in the allViolationsData array.
+      */
+     function populateFormForViolation(index) {
+       if (index < 0 || index >= allViolationsData.length) {
+         console.error("Invalid violation index:", index);
+         return;
+       }
+
+       const violationData = allViolationsData[index];
+       console.log(`Populating form for violation index ${index}:`, violationData);
+
+       // Clear existing highlights first
+       form.querySelectorAll('.auto-detected, .overridden').forEach(el => {
+          el.classList.remove('auto-detected', 'overridden');
+       });
+       ocrWarningDiv.style.display = 'none'; // Hide override warning when changing violation
+
+
+       // Map OCR data keys to form field IDs
+       const fieldMapping = {
+         licensePlate: 'licensePlate', licenseState: 'licensePlateState',
+         violationDate: 'violationDate', violationTime: 'violationTime', // Keep these mappings
+         violationId: 'violationId', pinNumber: 'pinNumber',
+         issuingAgency: 'issuingAgency', violationType: 'violationType',
+         violationLocation: 'violationLocation', originalPenaltyAmount: 'originalPenalty',
+         additionalPenaltyAmount: 'additionalPenalty', paymentWebsite: 'notes', // Note: This maps website to Notes
+         dueDate: 'dueDate'
+       };
+
+       let populatedCount = 0;
+       for (const ocrKey in fieldMapping) {
+         const fieldId = fieldMapping[ocrKey];
+         const field = document.getElementById(fieldId);
+         if (field) {
+            const rawValue = violationData[ocrKey];
+            let valueToSet = (rawValue !== undefined && rawValue !== null) ? String(rawValue) : ''; // Ensure it's a string or empty
+
+            // *** APPLY FORMATTING SPECIFICALLY FOR DATE AND TIME INPUTS ***
+            if (fieldId === 'violationDate') {
+                valueToSet = parseDateForInput(valueToSet) || ''; // Use helper, fallback to empty if parse fails
+                console.log(`Formatted violationDate for input: ${valueToSet} (Original: ${rawValue})`); // Debug Log
+            } else if (fieldId === 'violationTime') {
+                valueToSet = parseTimeForInput(valueToSet) || ''; // Use helper, fallback to empty if parse fails
+                console.log(`Formatted violationTime for input: ${valueToSet} (Original: ${rawValue})`); // Debug Log
+            } else if (fieldId === 'dueDate') {
+                // Also format the due date if present
+                valueToSet = parseDateForInput(valueToSet) || '';
+                console.log(`Formatted dueDate for input: ${valueToSet} (Original: ${rawValue})`); // Debug Log
+            }
+            // *** END SPECIFIC FORMATTING ***
+
+            field.value = valueToSet; // Set the potentially formatted value
+
+            // Add highlighting only if a value was successfully set (either original or formatted)
+            if (valueToSet !== '') {
+              field.classList.add('auto-detected'); // Mark as auto-detected if value exists
+              populatedCount++;
+            }
+         } else {
+            console.warn(`Form field with ID '${fieldId}' not found for OCR key '${ocrKey}'.`);
+         }
+       }
+
+         // Special handling for notes - Overwrites notes field with paymentWebsite if it exists
+         const notesField = document.getElementById('notes');
+         if (notesField && violationData.paymentWebsite) {
+             notesField.value = violationData.paymentWebsite; // Overwrites notes
+             if (!notesField.classList.contains('overridden')) { // Only highlight if not manually changed
+                  notesField.classList.add('auto-detected');
+                  populatedCount++; // Count this as populated if website exists
+             }
+         } else if (notesField) {
+            // Clear notes field if no paymentWebsite from OCR (unless manually overridden)
+            if (!notesField.classList.contains('overridden')) {
+               // notesField.value = ''; // Optional: Clear if no website. Decide if needed.
+            }
+         }
+
+
+       // Update hidden index field
+       document.getElementById('currentViolationIndex').value = index;
+
+        // Update progress bar status
+        updateProgressBar('progressPopulate', 'complete', `Populated form for violation ${index + 1} of ${allViolationsData.length}.`);
+        console.log(`Finished populating form. Populated fields count: ${populatedCount}`);
+     }
+
+    /**
+     * Updates the multi-violation navigation UI (button states, indicator).
+     */
+    function updateViolationNavUI() {
+      const totalViolations = allViolationsData.length;
+      violationIndicator.textContent = `Violation ${currentViolationIndex + 1} of ${totalViolations}`; // Use constant
+      prevViolationBtn.disabled = (currentViolationIndex === 0); // Use constant
+      nextViolationBtn.disabled = (currentViolationIndex === totalViolations - 1); // Use constant
+    }
+
+    /**
+     * Changes the displayed violation.
+     * @param {number} direction -1 for previous, 1 for next.
+     */
+    function changeViolation(direction) {
+       const newIndex = currentViolationIndex + direction;
+       if (newIndex >= 0 && newIndex < allViolationsData.length) {
+         currentViolationIndex = newIndex;
+         populateFormForViolation(currentViolationIndex); // Calls populate which uses constants
+         updateViolationNavUI(); // Calls function which uses constants
+       }
+    }
+
+    /**
+     * Marks an input as manually overridden by the user.
+     */
+    function markOverridden(inputElement) {
+      inputElement.classList.remove('auto-detected');
+      inputElement.classList.add('overridden');
+      ocrWarningDiv.style.display = 'block'; // Uses constant
+    }
+
+    // ****** INSERT THE MISSING FUNCTION DEFINITION HERE ******
+    /**
+     * Updates the status of a specific stage in the progress bar.
+     */
+    function updateProgressBar(stageId, status, text) {
+      var stageElement = document.getElementById(stageId);
+      if (!stageElement) return;
+      stageElement.className = 'progress-stage ' + status; // Reset classes
+
+      var iconElement = stageElement.querySelector('i');
+      if (iconElement) {
+        iconElement.className = 'fas '; // Reset icon classes
+        switch (status) {
+          case 'active': iconElement.classList.add('fa-spinner', 'fa-spin'); break;
+          case 'complete': iconElement.classList.add('fa-check-circle'); break;
+          case 'error': iconElement.classList.add('fa-times-circle'); break;
+          default: // pending or initial state based on ID
+            if (stageId === 'progressUpload') iconElement.classList.add('fa-cloud-upload-alt');
+            else if (stageId === 'progressAnalyze') iconElement.classList.add('fa-search');
+            else if (stageId === 'progressPopulate') iconElement.classList.add('fa-edit');
+            break;
+        }
+      }
+
+      // Update text
+      var textNode = stageElement.childNodes[1]; // Assuming icon is 0, text is 1
+      if (text && textNode && textNode.nodeType === Node.TEXT_NODE) {
+           textNode.nodeValue = " " + text;
+       } else if (text) {
+           // Fallback if structure is different or text node doesn't exist
+           let found = false;
+           for(let i=0; i<stageElement.childNodes.length; i++){
+               if(stageElement.childNodes[i].nodeType === Node.TEXT_NODE){
+                   stageElement.childNodes[i].nodeValue = " " + text;
+                   found = true;
+                   break;
+               }
+           }
+           if(!found){ stageElement.appendChild(document.createTextNode(" " + text));}
+       }
+    }
+    // ****** END OF INSERTED FUNCTION ******
+
+
+    /**
+     * Handles file selection (browse or drag/drop) and initiates server processing.
+     */
+    function handleFileSelect(event) {
+      var file = event.target ? event.target.files[0] : event.dataTransfer.files[0];
+      if (!file) return;
+
+      // --- Reset UI ---
+      uploadStatus.textContent = ""; // Uses constant
+      uploadStatus.style.color = "#555";
+      statusDiv.textContent = ""; // Uses constant
+      ocrWarningDiv.style.display = 'none'; // Uses constant
+      progressBarContainer.style.display = "block"; // Uses constant
+      updateProgressBar('progressUpload', 'pending', 'Preparing Upload...'); // CALLS the function
+      updateProgressBar('progressAnalyze', 'pending', 'Awaiting Upload...');
+      updateProgressBar('progressPopulate', 'pending', 'Awaiting Analysis...');
+      submitBtn.disabled = true; // Uses constant
+      // Clear previous OCR results and styling
+      const ocrFields = form.querySelectorAll('input[type="text"], input[type="date"], input[type="time"], input[type="number"], textarea'); // Uses constant
+      ocrFields.forEach(field => {
+        field.value = '';
+        field.classList.remove('auto-detected', 'overridden');
+      });
+      document.getElementById('ticketPDF').value = '';
+      document.getElementById('ticketFileId').value = '';
+      // Reset multi-violation display
+      multiInfoDiv.style.display = 'none'; // Uses constant
+      allViolationsData = [];
+      currentViolationIndex = 0;
+      // --- End Reset UI ---
+
+
+      if (file.type !== 'application/pdf') {
+        uploadStatus.textContent = "Error: Only PDF files are accepted.";
+        uploadStatus.style.color = "#a50e0e";
+        progressBarContainer.style.display = "none";
+        return;
+      }
+
+      updateProgressBar('progressUpload', 'active', 'Uploading Ticket...'); // CALLS the function
+      uploadStatus.textContent = "Starting upload...";
+
+      var reader = new FileReader();
+      reader.onload = function(e) {
+        var base64Data = e.target.result.split(',')[1];
+        var fileData = { name: file.name, mimeType: file.type, data: base64Data };
+
+        // --- Call Server: Upload and Analyze ---
+        google.script.run
+            .withSuccessHandler(function(result) {
+            // Analysis Success with violations
+            if (result && result.success && result.ocrData && Array.isArray(result.ocrData.violations) && result.ocrData.violations.length > 0) {
+              updateProgressBar('progressUpload', 'complete', 'Upload Complete');
+              document.getElementById('ticketPDF').value = result.fileUrl || '';
+              document.getElementById('ticketFileId').value = result.fileId || '';
+              uploadStatus.textContent = "Upload successful! Analyzing ticket...";
+              uploadStatus.style.color = "#137333";
+              updateProgressBar('progressAnalyze', 'complete', 'Analysis Complete');
+              updateProgressBar('progressPopulate', 'active', 'Populating Form...');
+
+              allViolationsData = result.ocrData.violations;
+              currentViolationIndex = 0;
+              document.getElementById('isLateNotice').value = result.ocrData.isLateNotice || false;
+
+              populateFormForViolation(currentViolationIndex); // Calls populate which now calls updateProgressBar
+
+              if (allViolationsData.length > 1) {
+                multiTextSpan.textContent = `Multiple violations (${allViolationsData.length}) detected in this PDF.`;
+                multiInfoDiv.style.display = 'block';
+                multiNavDiv.style.display = 'block';
+                updateViolationNavUI();
+              } else {
+                multiInfoDiv.style.display = 'none';
+              }
+
+              statusDiv.textContent = "Ticket analyzed. Please review and correct details before submitting.";
+              statusDiv.style.color = "#3367d6";
+              submitBtn.disabled = false;
+
+            // Analysis Success with ZERO violations
+            } else if (result && result.success && result.ocrData && Array.isArray(result.ocrData.violations) && result.ocrData.violations.length === 0) {
+               updateProgressBar('progressUpload', 'complete', 'Upload Complete');
+               document.getElementById('ticketPDF').value = result.fileUrl || '';
+               document.getElementById('ticketFileId').value = result.fileId || '';
+               uploadStatus.textContent = "Upload successful! Analysis complete.";
+               uploadStatus.style.color = "#137333";
+               updateProgressBar('progressAnalyze', 'complete', 'Analysis Complete (0 Violations Found)');
+               updateProgressBar('progressPopulate', 'complete', 'No violations to populate.');
+
+               allViolationsData = [];
+               currentViolationIndex = 0;
+               document.getElementById('isLateNotice').value = result.ocrData.isLateNotice || false;
+
+               statusDiv.textContent = "Ticket analyzed: 0 violations found matching expected format. No data to submit.";
+               statusDiv.style.color = "#e67e22";
+               submitBtn.disabled = true;
+
+            // Analysis Failure or other error
+            } else {
+              const errorMsg = result ? (result.message || "Analysis failed or returned invalid data.") : "Unknown server error during processing.";
+              console.error("Processing Error:", errorMsg, "Result:", result);
+              // Attempt to update progress bars even on error
+              updateProgressBar('progressUpload', result?.success ? 'complete' : 'error', result?.success ? 'Upload OK' : 'Upload Failed'); // Mark upload complete if it technically succeeded before analysis error
+              updateProgressBar('progressAnalyze', 'error', 'Analysis Failed');
+              updateProgressBar('progressPopulate', 'error', 'Not Started');
+              statusDiv.textContent = "Error: " + errorMsg;
+              statusDiv.style.color = "#a50e0e";
+              submitBtn.disabled = true; // Ensure submit is disabled on error
+            }
+          })
+          .withFailureHandler(function(error) {
+            // --- Server Call Failure ---
+            console.error("Server Call Error:", error);
+            updateProgressBar('progressUpload', 'error', 'Server Error');
+            updateProgressBar('progressAnalyze', 'error', 'Not Started');
+            updateProgressBar('progressPopulate', 'error', 'Not Started');
+            statusDiv.textContent = "Server Error: " + error.message;
+            statusDiv.style.color = "#a50e0e";
+             submitBtn.disabled = true; // Ensure submit is disabled on error
+          })
+          .uploadAndAnalyzeTicket(fileData); // Call the backend function
+      };
+      reader.onerror = function(err) {
+        console.error("File Read Error:", err);
+        updateProgressBar('progressUpload', 'error', 'File Read Error');
+        uploadStatus.textContent = "Error reading file: " + err;
+        uploadStatus.style.color = "#a50e0e";
+        progressBarContainer.style.display = "none";
+         submitBtn.disabled = true; // Ensure submit is disabled on error
+      };
+      reader.readAsDataURL(file);
+    }
+
+
+     /**
+      * Gathers form data FOR ALL VIOLATIONS and sends to the server.
+      */
+     function submitTicket() {
+       submitBtn.disabled = true;
+       submitBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Submitting...';
+       statusDiv.textContent = "Processing submission...";
+       statusDiv.style.color = "#3367d6";
+
+       // --- IMPORTANT: Update the current violation data first ---
+       if (allViolationsData.length > 0 && currentViolationIndex >= 0) {
+          const currentData = allViolationsData[currentViolationIndex];
+
+          const licensePlateField = document.getElementById('licensePlate');
+          const licenseStateField = document.getElementById('licensePlateState');
+          const violationDateField = document.getElementById('violationDate');
+          const violationTimeField = document.getElementById('violationTime');
+          const violationIdField = document.getElementById('violationId');
+          const pinNumberField = document.getElementById('pinNumber');
+          const issuingAgencyField = document.getElementById('issuingAgency');
+          const violationTypeField = document.getElementById('violationType');
+          const violationLocationField = document.getElementById('violationLocation');
+          const originalPenaltyField = document.getElementById('originalPenalty');
+          const additionalPenaltyField = document.getElementById('additionalPenalty');
+          const notesField = document.getElementById('notes');
+          const dueDateField = document.getElementById('dueDate');
+
+          currentData.licensePlate = licensePlateField.value;
+          currentData.licenseState = licenseStateField.value;
+          currentData.violationId = violationIdField.value;
+          currentData.pinNumber = pinNumberField.value;
+          currentData.issuingAgency = issuingAgencyField.value;
+          currentData.violationType = violationTypeField.value;
+          currentData.violationLocation = violationLocationField.value;
+          currentData.originalPenaltyAmount = originalPenaltyField.value;
+          currentData.additionalPenaltyAmount = additionalPenaltyField.value;
+          currentData.notes = notesField.value;
+
+          // Handle Date/Time Overrides
+          if (violationDateField.classList.contains('overridden')) {
+              currentData.violationDate = violationDateField.value;
+              console.log("Violation Date was overridden, sending:", currentData.violationDate);
+          } else {
+              console.log("Violation Date not overridden, sending original:", currentData.violationDate);
+          }
+          if (violationTimeField.classList.contains('overridden')) {
+              currentData.violationTime = violationTimeField.value;
+              console.log("Violation Time was overridden, sending:", currentData.violationTime);
+          } else {
+              console.log("Violation Time not overridden, sending original:", currentData.violationTime);
+          }
+          if (dueDateField.classList.contains('overridden')) {
+              currentData.dueDate = dueDateField.value;
+              console.log("Due Date was overridden, sending:", currentData.dueDate);
+          } else {
+              console.log("Due Date not overridden, sending original:", currentData.dueDate);
+          }
+
+          console.log("Updated allViolationsData at index", currentViolationIndex, "with current form values before sending.");
+       } else {
+          console.warn("Cannot update current violation data - no violations loaded or index invalid.");
+       }
+
+       // --- Prepare data package for server ---
+       var dataToSend = {
+         ticketPDF: document.getElementById('ticketPDF').value,
+         ticketFileId: document.getElementById('ticketFileId').value,
+         isLateNotice: (document.getElementById('isLateNotice').value === 'true'),
+         violations: allViolationsData
+       };
+
+       console.log("Submitting Full Data Package:", JSON.stringify(dataToSend, null, 2));
+
+       google.script.run
+         .withSuccessHandler(function(msg) {
+           statusDiv.textContent = msg || "Ticket data submitted successfully!";
+           statusDiv.style.color = "#137333";
+           submitBtn.innerHTML = 'Submit Ticket Data';
+            setTimeout(function(){ google.script.host.close(); }, 2500);
+         })
+         .withFailureHandler(function(error) {
+           console.error("Submission Error:", error);
+           statusDiv.textContent = "Error submitting data: " + error.message;
+           statusDiv.style.color = "#a50e0e";
+           submitBtn.disabled = false;
+           submitBtn.innerHTML = 'Submit Ticket Data';
+         })
+         .addMultipleTicketData(dataToSend);
+     }
+
+
+    // --- Drag & Drop Setup (Now 'dropZone' and 'fileInput' are defined) ---
+    // Check if dropZone exists before adding listeners (robustness)
+    if (dropZone) {
+        dropZone.addEventListener('click', () => {
+          if (fileInput) fileInput.click(); // Check fileInput too
+        });
+        ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+          dropZone.addEventListener(eventName, preventDefaults, false);
+          document.body.addEventListener(eventName, preventDefaults, false);
+        });
+        ['dragenter', 'dragover'].forEach(eventName => {
+          dropZone.addEventListener(eventName, highlight, false);
+        });
+        ['dragleave', 'drop'].forEach(eventName => {
+          dropZone.addEventListener(eventName, unhighlight, false);
+        });
+        dropZone.addEventListener('drop', handleDrop, false);
+    } else {
+        console.error("Drop zone element not found!");
+    }
+
+    // --- Drag & Drop Handler Functions ---
+    function preventDefaults(e) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+    function highlight() {
+      if (dropZone) dropZone.classList.add('dragover'); // Check dropZone exists
+    }
+    function unhighlight() {
+      if (dropZone) dropZone.classList.remove('dragover'); // Check dropZone exists
+    }
+    function handleDrop(e) {
+      // preventDefaults(e) is called by the listener already
+      var dt = e.dataTransfer;
+      if (dt && dt.files && dt.files.length) { // Check dt exists
+        handleFileSelect({ dataTransfer: dt }); // Pass the event-like object
+      } else {
+        console.warn("Drop event occurred but no files found in dataTransfer.");
+      }
+    }
+    // --- End Drag & Drop ---
+
+
+    // Initial state
+     window.onload = function() {
+       if (submitBtn) submitBtn.disabled = true; // Check submitBtn exists
+       // Any other initial setup
+     };
+
+  </script>
+</body>
+</html>

@@ -1,0 +1,806 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+  <style>
+    body { font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif; margin: 0; padding: 0; display: flex; height: 100vh; background-color: #f0f2f5; }
+    #queue { width: 300px; min-width:250px; max-width:400px; height: 100vh; border-right: 1px solid #d1d5db; background-color: #f9fafb; overflow-y: auto; padding: 10px; display: flex; flex-direction: column; box-sizing: border-box; }
+    #viewer { flex: 1; display: flex; flex-direction: column; background-color: #ffffff; }
+    #pdfPane { flex: 1; border: none; min-height: 300px; } /* Ensure PDF pane is visible */
+    #formPaneContainer { height: 45%; /* Adjust as needed */ overflow-y: auto; padding: 15px; border-top: 1px solid #d1d5db; background-color: #f9fafb; box-sizing: border-box;}
+
+    #fileInput { display: block; width: calc(100% - 16px); padding: 8px; margin: 0 auto 10px auto; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
+    #dropHint { margin: 10px 0; color: #6b7280; font-size: 0.875rem; text-align: center; padding: 20px; border: 2px dashed #d1d5db; border-radius: 6px; background-color: #fff; }
+    #dropHint.hidden { display: none; }
+    #fileCards { margin-top:10px; }
+
+    .card { border: 1px solid #d1d5db; border-radius: 6px; padding: 10px; margin-bottom: 8px; font-size: 0.875rem; background-color: #ffffff; cursor: pointer; transition: border-color 0.2s, box-shadow 0.2s; }
+    .card:hover { border-color: #9ca3af; }
+    .card.active-card { border-color: #3b82f6; box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.4); }
+    .card strong { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-bottom: 4px; color: #1f2937;}
+    .card .status-text { font-size: 0.8rem; }
+    .state-pending { color: #60a5fa; } /* Lighter blue for pending */
+    .state-processing { color: #3b82f6; } /* Tailwind blue-500 */
+    .state-error { color: #ef4444; } /* Tailwind red-500 */
+    .state-complete { color: #22c55e; } /* Tailwind green-500 */
+    .state-submitted { color: #16a34a; font-weight: bold; } /* Darker green for submitted */
+
+
+    /* Drag-and-drop highlight */
+    #queue.drag-over { background-color: #e0e7ff; border-color: #3b82f6; }
+    #queue.drag-over #dropHint { border-color: #3b82f6; background-color: #eff6ff; }
+
+    /* Form Styles (copied and adapted from AddTicketForm-ORIGINAL.html) */
+    #formPaneContainer form { background-color: transparent; /* Form takes background from container */ }
+    #formPaneContainer label { display: block; margin-top: 12px; font-weight: 600; color: #374151; font-size: 0.875rem; }
+    #formPaneContainer input[type="text"],
+    #formPaneContainer input[type="date"],
+    #formPaneContainer input[type="time"],
+    #formPaneContainer input[type="number"],
+    #formPaneContainer textarea,
+    #formPaneContainer select {
+      width: 100%; padding: 8px 10px; margin-top: 4px; border: 1px solid #d1d5db; border-radius: 4px; box-sizing: border-box; font-size: 0.9rem; background-color: #fff;
+    }
+    #formPaneContainer textarea { min-height: 60px; resize: vertical; }
+    #formPaneContainer button.submit-ticket-btn {
+        margin-top: 20px; padding: 10px 18px; width: 100%; background-color: #3b82f6; color: white;
+        border: none; border-radius: 5px; cursor: pointer; font-size: 0.95rem; transition: background-color 0.2s;
+        display: flex; align-items: center; justify-content: center; gap: 8px;
+    }
+    #formPaneContainer button.submit-ticket-btn:hover { background-color: #2563eb; }
+    #formPaneContainer button.submit-ticket-btn:disabled { background-color: #9ca3af !important; color: #e5e7eb !important; cursor: not-allowed; }
+
+    #formPaneContainer #statusInForm { margin-top: 15px; font-weight: bold; text-align: center; min-height: 1.2em; font-size: 0.875rem;}
+    #formPaneContainer #ocrOverrideWarningInForm { display: none; color: #f97316; margin-top: 8px; font-size: 0.8rem; text-align: center; }
+
+    #formPaneContainer .auto-detected { background-color: #f0fdf4 !important; border-color: #86efac !important; }
+    #formPaneContainer .overridden { background-color: #fffbeb !important; border-color: #fde047 !important; }
+
+    #formPaneContainer .form-row { display: flex; gap: 15px; margin-top: 10px; }
+    #formPaneContainer .form-group { flex: 1; }
+    #formPaneContainer .form-group label { margin-top: 0; }
+
+    #formPaneContainer #multiViolationInfoInForm { display: none; background-color: #fefce8; border: 1px solid #fde047; padding: 10px; margin-bottom: 15px; border-radius: 4px; text-align: center; font-size: 0.875rem; }
+    #formPaneContainer #multiViolationInfoInForm button {
+        width: auto; padding: 6px 12px; margin: 0 5px; background-color: #6b7280; color:white;
+        border:none; border-radius:4px; font-size: 0.8rem; cursor: pointer;
+    }
+    #formPaneContainer #multiViolationInfoInForm button:hover { background-color: #4b5563; }
+    #formPaneContainer #multiViolationInfoInForm button:disabled { background-color: #d1d5db; cursor: not-allowed;}
+    #formPaneContainer .fa-spinner { animation: spin 1s linear infinite; }
+    @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <div id="queue">
+    <input id="fileInput" type="file" accept="application/pdf" multiple title="Choose PDF files" />
+    <div id="dropHint">
+        <i class="fas fa-cloud-upload-alt fa-2x" style="color:#9ca3af; margin-bottom:8px;"></i><br>
+        Drop PDFs here or click "Choose Files"
+    </div>
+    <div id="fileCards"></div>
+    <button type="button" id="submitAllReviewedBtn" style="width: calc(100% - 16px); margin: 15px auto 10px auto; padding: 10px; background-color: #16a34a; color: white; border: none; border-radius: 5px; font-size: 0.9rem; cursor: pointer; display: none;">
+    <i class="fas fa-tasks"></i> Submit All Reviewed to Sheet
+</button>
+<div id="batchSubmitStatus" style="text-align: center; font-size: 0.85rem; margin-top: 5px;"></div>
+  </div>
+  <div id="viewer">
+    <iframe id="pdfPane" title="PDF Preview"></iframe>
+    <div id="formPaneContainer">
+        <div id="formPanePlaceholder" style="text-align:center; color:#6b7280; padding-top:50px;">
+            <i class="fas fa-file-alt fa-3x" style="margin-bottom:15px;"></i><br>
+            Select a processed PDF from the left to view details and submit.
+        </div>
+        <!-- Form will be injected here by JavaScript -->
+    </div>
+  </div>
+
+  <template id="violationFormTpl">
+    <form onsubmit="return false;"> <!-- Prevent default form submission -->
+      <input type="hidden" id="activePdfIsLateNoticeField" name="activePdfIsLateNoticeField" value="false">
+
+      <div id="multiViolationInfoInForm">
+        <span id="multiViolationTextInForm"></span>
+        <div id="multiViolationNavInForm" style="margin-top: 8px;">
+          <button type="button" id="prevViolationBtnInForm"><i class="fas fa-chevron-left"></i> Previous</button>
+          <span id="violationIndicatorInForm" style="font-weight: bold; margin: 0 10px;"></span>
+          <button type="button" id="nextViolationBtnInForm">Next <i class="fas fa-chevron-right"></i></button>
+        </div>
+      </div>
+
+      <div id="ocrOverrideWarningInForm">Heads up! You've manually changed some auto-detected values.</div>
+
+      <div class="form-row">
+        <div class="form-group">
+          <label for="licensePlate">License Plate (B*):</label>
+          <input type="text" id="licensePlate" name="licensePlate" required oninput="markOverridden(this)">
+        </div>
+        <div class="form-group">
+          <label for="licensePlateState">License Plate State (C*):</label>
+          <input type="text" id="licensePlateState" name="licensePlateState" required oninput="markOverridden(this)">
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label for="violationDate">Violation Date (D*):</label>
+          <input type="date" id="violationDate" name="violationDate" required oninput="markOverridden(this)">
+        </div>
+        <div class="form-group">
+          <label for="violationTime">Violation Time (E*):</label>
+          <input type="time" id="violationTime" name="violationTime" required step="1" oninput="markOverridden(this)">
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label for="violationId">Violation ID # (F*):</label>
+          <input type="text" id="violationId" name="violationId" required oninput="markOverridden(this)">
+        </div>
+        <div class="form-group">
+          <label for="pinNumber">PIN number (if available) (G*):</label>
+          <input type="text" id="pinNumber" name="pinNumber" oninput="markOverridden(this)">
+        </div>
+      </div>
+      <label for="issuingAgency">Issuing Agency (H*):</label>
+      <input type="text" id="issuingAgency" name="issuingAgency" required oninput="markOverridden(this)">
+      <label for="violationType">Violation Type (I*):</label>
+      <input type="text" id="violationType" name="violationType" required oninput="markOverridden(this)">
+      <label for="violationLocation">Violation Location (J*):</label>
+      <textarea id="violationLocation" name="violationLocation" required oninput="markOverridden(this)"></textarea>
+      <div class="form-row">
+        <div class="form-group">
+          <label for="originalPenalty">Original Billable Penalty ($) (Q*):</label>
+          <input type="number" step="0.01" id="originalPenalty" name="originalPenalty" required oninput="markOverridden(this)">
+        </div>
+        <div class="form-group">
+          <label for="additionalPenalty">Add'l Penalty ($) (if applicable) (R*):</label>
+          <input type="number" step="0.01" id="additionalPenalty" name="additionalPenalty" oninput="markOverridden(this)">
+        </div>
+      </div>
+      <label for="notes">Notes (Website for payment, etc.) (T*):</label>
+      <textarea id="notes" name="notes" oninput="markOverridden(this)"></textarea>
+      <label for="dueDate">Due date (if available) (U*):</label>
+      <input type="date" id="dueDate" name="dueDate" oninput="markOverridden(this)">
+
+      <div id="statusInForm"></div>
+      <button type="button" id="submitActiveTicketBtn" class="submit-ticket-btn">
+        <i class="fas fa-check-circle"></i> Submit This Ticket to Sheet
+      </button>
+    </form>
+  </template>
+
+<script>
+// Global variables (declare them here if they need to be accessed by multiple top-level functions)
+let allUploadedFileResults = [];
+let activeCardIndex = -1;
+let activePdfOriginalOcrViolations = [];
+let activePdfModifiedViolationsData = [];
+let activePdfCurrentViolationDisplayIndex = 0;
+let activePdfIsLateNotice = false;
+let activePdfFileUrl = '';
+let activePdfFileId = '';
+let activeCardElement = null;
+
+// DOM Element constants - will be assigned in window.onload
+let fileInput, dropZone, dropHint, fileCardsContainer, pdfPane, formPaneContainer, formPanePlaceholder;
+
+// Utility to query selector
+const q = sel => document.querySelector(sel);
+const qa = sel => document.querySelectorAll(sel);
+
+window.onload = function() {
+  console.log("window.onload triggered. Initializing DOM elements and listeners.");
+
+  // Assign DOM elements now that the DOM is loaded
+  fileInput = q('#fileInput');
+  dropZone = q('#queue');
+  dropHint = q('#dropHint');
+  fileCardsContainer = q('#fileCards');
+  pdfPane = q('#pdfPane');
+  formPaneContainer = q('#formPaneContainer');
+  formPanePlaceholder = q('#formPanePlaceholder');
+
+  if (!dropZone) {
+    console.error("CRITICAL: dropZone element (#queue) not found!");
+    return; // Stop if the main drop zone isn't found
+  }
+  if (!fileInput) {
+    console.error("CRITICAL: fileInput element (#fileInput) not found!");
+  }
+
+  dropHint.classList.remove('hidden');
+
+  const submitAllBtn = q('#submitAllReviewedBtn');
+  if (submitAllBtn) {
+    submitAllBtn.onclick = submitAllReviewedTickets;
+    console.log("submitAllReviewedBtn onclick assigned");
+  } else {
+    console.error("submitAllReviewedBtn not found!");
+  }
+
+  // --- Direct Drag-and-Drop Event Listener Attachment ---
+  console.log("Attaching D&D listeners directly...");
+
+  // For dragenter and dragover, we MUST preventDefault for 'drop' to work.
+  dropZone.addEventListener('dragenter', function(e) {
+    console.log('Event: dragenter on dropZone');
+    e.preventDefault();
+    e.stopPropagation();
+    dropZone.classList.add('drag-over');
+  }, false);
+
+  dropZone.addEventListener('dragover', function(e) {
+    console.log('Event: dragover on dropZone (IMPORTANT: must preventDefault)');
+    e.preventDefault();
+    e.stopPropagation();
+    // It's common to set e.dataTransfer.dropEffect here, though not strictly necessary for preventDefault
+    // e.dataTransfer.dropEffect = 'copy'; 
+    dropZone.classList.add('drag-over'); // Ensure this is consistently applied
+  }, false);
+
+  dropZone.addEventListener('dragleave', function(e) {
+    console.log('Event: dragleave on dropZone');
+    e.preventDefault();
+    e.stopPropagation();
+    // More robust check for leaving the actual dropZone
+    if (e.relatedTarget === null || !dropZone.contains(e.relatedTarget)) {
+        dropZone.classList.remove('drag-over');
+    }
+  }, false);
+
+  dropZone.addEventListener('drop', function(e) {
+    console.log('Event: drop on dropZone (Top of handler)');
+    e.preventDefault(); // ABSOLUTELY CRITICAL
+    e.stopPropagation(); // Stop event from bubbling further
+
+    dropZone.classList.remove('drag-over');
+    console.log('Drop event fired on #queue. e.dataTransfer:', e.dataTransfer);
+
+    if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      const files = [...e.dataTransfer.files].filter(f => f.type === 'application/pdf');
+      console.log("Files after filter:", files);
+      if (!files.length) {
+        console.log("No PDF files after filtering.");
+        return;
+      }
+      uploadAndProcessBatch(files);
+    } else {
+      console.log("No files found in e.dataTransfer.files or e.dataTransfer is null.");
+    }
+  }, false);
+
+  // Prevent default for body as well to stop browser from opening file if dropped outside dropzone
+  ['dragenter', 'dragover', 'drop'].forEach(eventName => {
+      document.body.addEventListener(eventName, function(e) {
+          // Only prevent default if the target is not the dropZone or its children,
+          // or if we're specifically trying to catch drops outside the intended area.
+          // For simplicity now, let's always prevent default on body for dragover to stop navigation.
+          // For 'drop' on body, we also prevent default.
+          if (!dropZone.contains(e.target)) {
+              console.log('Event:', eventName, 'on document.body (outside dropZone)');
+              e.preventDefault();
+              e.stopPropagation();
+          }
+      }, false);
+  });
+  
+  if (fileInput) {
+    fileInput.onchange = function(e) { // Changed to function(e) for clarity
+        console.log("fileInput changed");
+        const files = [...e.target.files].filter(f => f.type === 'application/pdf');
+        if (!files.length) return;
+        uploadAndProcessBatch(files);
+    };
+  }
+
+  console.log("All event listeners in window.onload attached.");
+};
+
+// --- Rest of your functions (uploadAndProcessBatch, addCard, etc.) go here ---
+// Make sure they are defined OUTSIDE of the window.onload function if they were before,
+// or inside if that was the original structure, but ensure they are accessible.
+// Based on your provided full HTML, they are global functions, so they should remain outside window.onload.
+
+function uploadAndProcessBatch(files) {
+  // ... (your existing function content)
+  console.log("uploadAndProcessBatch called with files:", files);
+  dropHint.classList.add('hidden');
+  fileCardsContainer.innerHTML = ""; // Clear previous cards
+  allUploadedFileResults = [];
+  activeCardIndex = -1;
+  formPaneContainer.innerHTML = ''; // Clear form pane
+  formPaneContainer.appendChild(formPanePlaceholder); // Show placeholder
+  pdfPane.src = 'about:blank';
+
+
+  const fileDataPromises = files.map((file, index) => {
+    addCard(index, file.name, 'state-pending', 'Queued for upload...');
+    return new Promise(resolve => {
+      const reader = new FileReader();
+      reader.onload = e_reader => resolve({ name: file.name, data: e_reader.target.result.split(',')[1], mimeType: file.type, originalIndex: index });
+      reader.onerror = () => {
+        updateCardStatus(index, 'state-error', `Error reading file: ${file.name}`);
+        resolve({ name: file.name, error: true, originalIndex: index, message: 'File read error' });
+      };
+      reader.readAsDataURL(file);
+    });
+  });
+
+  Promise.all(fileDataPromises).then(fileDataArray => {
+    const validFilesToProcess = fileDataArray.filter(fd => !fd.error);
+    if (validFilesToProcess.length === 0) {
+        console.log("No valid files to upload to server.");
+        return;
+    }
+
+    validFilesToProcess.forEach(fd => {
+        updateCardStatus(fd.originalIndex, 'state-processing', 'Uploading & Analyzing...');
+    });
+
+    google.script.run
+      .withSuccessHandler(renderBatchResults)
+      .withFailureHandler(err => {
+        console.error("Batch Upload/Analysis Error:", err);
+        validFilesToProcess.forEach(fd => {
+            const card = q(`#card-${fd.originalIndex}`);
+            if (card && card.querySelector('.status-text.state-processing')) {
+                 updateCardStatus(fd.originalIndex, 'state-error', `Batch processing error: ${err.message}`);
+            }
+        });
+        alert(`Batch processing failed: ${err.message}`);
+      })
+      .uploadAndAnalyzeTicketsBatch(validFilesToProcess.map(fd => ({name: fd.name, data: fd.data, mimeType: fd.mimeType })));
+  });
+}
+
+function addCard(originalIndex, name, statusClass = 'state-pending', statusText = 'Queued') {
+  // ... (your existing function content)
+  const el = document.createElement('div');
+  el.className = `card ${statusClass}`;
+  el.id = `card-${originalIndex}`;
+  el.innerHTML = `<strong>${name}</strong><br/><span class="status-text ${statusClass}">${statusText}</span>`;
+  el.onclick = () => activateCard(originalIndex);
+  fileCardsContainer.appendChild(el);
+}
+function updateCardVisualForReviewStatus(originalIndex, isReviewed, isSubmitted) {
+  // ... (your existing function content)
+  const card = q(`#card-${originalIndex}`);
+  if (!card) return;
+  const statusEl = card.querySelector('.status-text');
+  if (statusEl && !isSubmitted) {
+    if (isReviewed && statusEl.textContent === 'Ready for Review') {
+      statusEl.textContent = 'Reviewed / Modified';
+    }
+  }
+}
+function updateCardStatus(originalIndex, statusClass, statusText) {
+  // ... (your existing function content)
+  const card = q(`#card-${originalIndex}`);
+  if (!card) return;
+  const statusEl = card.querySelector('.status-text');
+  if (statusEl) {
+    statusEl.className = `status-text ${statusClass}`;
+    statusEl.textContent = statusText;
+  }
+  card.classList.remove('state-pending', 'state-processing', 'state-complete', 'state-error', 'state-submitted');
+  card.classList.add(statusClass);
+}
+
+function renderBatchResults(summary) {
+  // ... (your existing function content)
+  console.log("Batch results received:", summary);
+  allUploadedFileResults = summary.results.map((res, i) => {
+      const cardData = {
+          originalIndex: res.index,
+          name: res.name || `File ${res.index + 1}`,
+          success: res.success,
+          fileUrl: res.fileUrl,
+          fileId: res.fileId,
+          ocrData: res.ocrData || { isLateNotice: false, violations: [] },
+          message: res.message,
+          submitted: false,
+          reviewedSinceLoad: false
+      };
+      cardData.modifiedOcrData = JSON.parse(JSON.stringify(cardData.ocrData));
+      const cardIdToUpdate = res.index;
+
+      if (res.success) {
+        updateCardStatus(cardIdToUpdate, 'state-complete', 'Ready for Review');
+        const card = q(`#card-${cardIdToUpdate}`);
+        if(card) {
+            card.dataset.fileUrl = cardData.fileUrl;
+            card.dataset.fileId = cardData.fileId;
+        }
+      } else {
+        updateCardStatus(cardIdToUpdate, 'state-error', res.message || 'Analysis Failed');
+      }
+      return cardData;
+  });
+
+  const firstOkIndex = allUploadedFileResults.findIndex(r => r.success && !r.submitted);
+  if (firstOkIndex !== -1) {
+    activateCard(allUploadedFileResults[firstOkIndex].originalIndex);
+    if (q('#submitAllReviewedBtn')) q('#submitAllReviewedBtn').style.display = 'block';
+  } else {
+    if (q('#submitAllReviewedBtn')) q('#submitAllReviewedBtn').style.display = 'none';
+  }
+}
+
+function submitAllReviewedTickets() {
+  // ... (your existing function content)
+  if (activeCardIndex !== -1 && formPaneContainer.querySelector('form')) {
+      updateModifiedViolationDataFromForm(activePdfCurrentViolationDisplayIndex);
+      const currentResultData = allUploadedFileResults.find(r => r.originalIndex === activeCardIndex);
+      if (currentResultData) {
+          currentResultData.modifiedOcrData.violations = JSON.parse(JSON.stringify(activePdfModifiedViolationsData));
+          currentResultData.modifiedOcrData.isLateNotice = (q('#activePdfIsLateNoticeField') && q('#activePdfIsLateNoticeField').value === 'true');
+          if (!currentResultData.submitted) {
+            currentResultData.reviewedSinceLoad = true;
+            updateCardVisualForReviewStatus(currentResultData.originalIndex, true, false);
+          }
+      }
+  }
+
+  const packagesToSubmit = [];
+  allUploadedFileResults.forEach(item => {
+    if (item.success && !item.submitted) {
+      packagesToSubmit.push({
+        ticketPDF: item.fileUrl,
+        ticketFileId: item.fileId,
+        isLateNotice: item.modifiedOcrData.isLateNotice,
+        violations: item.modifiedOcrData.violations 
+      });
+    }
+  });
+
+  if (packagesToSubmit.length === 0) {
+    if(q('#batchSubmitStatus')) {
+      q('#batchSubmitStatus').textContent = 'No new tickets to submit.';
+      q('#batchSubmitStatus').style.color = '#6b7280';
+    }
+    return;
+  }
+
+  const submitBtn = q('#submitAllReviewedBtn');
+  const batchStatusDiv = q('#batchSubmitStatus');
+  if(submitBtn) {
+    submitBtn.disabled = true;
+    submitBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Submitting All...';
+  }
+  if(batchStatusDiv) {
+    batchStatusDiv.textContent = `Submitting ${packagesToSubmit.length} ticket(s)...`;
+    batchStatusDiv.style.color = '#3b82f6';
+  }
+
+  google.script.run
+    .withSuccessHandler(response => {
+      if(batchStatusDiv) {
+        batchStatusDiv.textContent = response.summary || "Batch submission complete.";
+        batchStatusDiv.style.color = response.failures > 0 ? '#ef4444' : '#16a34a';
+      }
+      if(submitBtn) {
+        submitBtn.innerHTML = '<i class="fas fa-tasks"></i> Submit All Reviewed to Sheet';
+        submitBtn.disabled = false;
+      }
+      if (response.failures === 0) {
+        packagesToSubmit.forEach(pkg => {
+          const submittedItem = allUploadedFileResults.find(item => item.fileUrl === pkg.ticketPDF && !item.submitted);
+          if (submittedItem) {
+            submittedItem.submitted = true;
+            updateCardStatus(submittedItem.originalIndex, 'state-submitted', 'Submitted to Sheet');
+            const cardEl = q(`#card-${submittedItem.originalIndex}`);
+            if(cardEl) cardEl.onclick = () => activateCard(submittedItem.originalIndex);
+          }
+        });
+      }
+      const activeResult = allUploadedFileResults.find(r => r.originalIndex === activeCardIndex);
+      if (activeResult && activeResult.submitted) {
+          formPaneContainer.innerHTML = ''; formPaneContainer.appendChild(formPanePlaceholder); pdfPane.src='about:blank';
+          if(activeCardElement) activeCardElement.classList.remove('active-card');
+      }
+
+      const remainingToSubmit = allUploadedFileResults.some(r => r.success && !r.submitted);
+      if (!remainingToSubmit && submitBtn) {
+        submitBtn.style.display = 'none';
+        dropHint.classList.remove('hidden');
+        dropHint.innerHTML = '<i class="fas fa-thumbs-up fa-2x" style="color:#22c55e; margin-bottom:8px;"></i><br>All processed tickets submitted!';
+      }
+    })
+    .withFailureHandler(error => {
+      console.error("Batch Submission Error:", error);
+      if(batchStatusDiv) {
+        batchStatusDiv.textContent = "Error during batch submission: " + error.message;
+        batchStatusDiv.style.color = '#ef4444';
+      }
+      if(submitBtn) {
+        submitBtn.disabled = false;
+        submitBtn.innerHTML = '<i class="fas fa-exclamation-triangle"></i> Retry All Submissions';
+      }
+    })
+    .addMultipleTicketDataBatch(packagesToSubmit);
+}
+function activateCard(originalFileIndex) {
+  // ... (your existing function content)
+  if (activeCardIndex !== -1 && activeCardIndex !== originalFileIndex && formPaneContainer.querySelector('form')) {
+    updateModifiedViolationDataFromForm(activePdfCurrentViolationDisplayIndex);
+    const previousResultData = allUploadedFileResults.find(r => r.originalIndex === activeCardIndex);
+    if (previousResultData) {
+      previousResultData.modifiedOcrData.violations = JSON.parse(JSON.stringify(activePdfModifiedViolationsData));
+      previousResultData.modifiedOcrData.isLateNotice = (q('#activePdfIsLateNoticeField') && q('#activePdfIsLateNoticeField').value === 'true');
+      if (!previousResultData.submitted) {
+        const hasChanged = JSON.stringify(previousResultData.modifiedOcrData) !== JSON.stringify(previousResultData.ocrData);
+        if (hasChanged || previousResultData.reviewedSinceLoad) {
+             previousResultData.reviewedSinceLoad = true;
+             updateCardVisualForReviewStatus(previousResultData.originalIndex, true, false);
+        }
+      }
+    }
+  }
+
+  if (activeCardIndex === originalFileIndex && activeCardElement && !activeCardElement.classList.contains('state-submitted') && !activeCardElement.classList.contains('state-error')) {
+      return;
+  }
+  
+  const resultData = allUploadedFileResults.find(r => r.originalIndex === originalFileIndex);
+  if (!resultData) {
+      console.warn("Cannot activate card: No result data found for index", originalFileIndex);
+      pdfPane.src = 'about:blank';
+      formPaneContainer.innerHTML = '';
+      formPaneContainer.appendChild(formPanePlaceholder);
+      if (activeCardElement) activeCardElement.classList.remove('active-card');
+      activeCardElement = null;
+      activeCardIndex = -1;
+      return;
+  }
+
+  if (!resultData.success && !resultData.submitted) {
+      console.warn("Cannot activate card: Analysis failed for index", originalFileIndex, resultData.message);
+      pdfPane.src = 'about:blank';
+      formPaneContainer.innerHTML = `<div style="padding:20px; text-align:center; color:#ef4444;">Error processing this PDF: ${resultData.message || 'Unknown analysis error.'}</div>`;
+      if (activeCardElement) activeCardElement.classList.remove('active-card');
+      activeCardElement = q(`#card-${originalFileIndex}`);
+      if (activeCardElement) activeCardElement.classList.add('active-card');
+      activeCardIndex = originalFileIndex;
+      return;
+  }
+  
+  if (resultData.submitted) {
+      console.log("Card already submitted, showing read-only info for index:", originalFileIndex);
+      pdfPane.src = resultData.fileUrl ? resultData.fileUrl.replace('/view?usp=sharing', '/preview').replace('/view', '/preview') : 'about:blank';
+      formPaneContainer.innerHTML = `<div style="padding:20px; text-align:center; color:#16a34a; font-weight:bold;"><i class="fas fa-check-circle"></i> This ticket has already been submitted.</div>`;
+      if (activeCardElement) activeCardElement.classList.remove('active-card');
+      activeCardElement = q(`#card-${originalFileIndex}`);
+      if (activeCardElement) activeCardElement.classList.add('active-card');
+      activeCardIndex = originalFileIndex;
+      return;
+  }
+
+  activeCardIndex = originalFileIndex;
+  activeCardElement = q(`#card-${originalFileIndex}`);
+
+  qa('.card').forEach(c => c.classList.remove('active-card'));
+  if (activeCardElement) activeCardElement.classList.add('active-card');
+
+  activePdfFileUrl = resultData.fileUrl;
+  activePdfFileId = resultData.fileId;
+  activePdfIsLateNotice = resultData.modifiedOcrData.isLateNotice;
+  activePdfModifiedViolationsData = JSON.parse(JSON.stringify(resultData.modifiedOcrData.violations || []));
+  resultData.reviewedSinceLoad = true;
+
+  pdfPane.src = activePdfFileUrl ? activePdfFileUrl.replace('/view?usp=sharing', '/preview').replace('/view', '/preview') : 'about:blank';
+  buildFormForActivePdf();
+}
+
+function buildFormForActivePdf() {
+  // ... (your existing function content)
+  formPaneContainer.innerHTML = '';
+  const template = q('#violationFormTpl').content.cloneNode(true);
+  formPaneContainer.appendChild(template);
+
+  q('#activePdfIsLateNoticeField').value = activePdfIsLateNotice;
+  activePdfCurrentViolationDisplayIndex = 0;
+
+  if (activePdfModifiedViolationsData.length > 0) {
+    populateFormForActivePdfViolation(activePdfCurrentViolationDisplayIndex);
+  } else {
+    q('#formPaneContainer form').innerHTML = '<p style="text-align:center; padding:20px;">No violations found in this document by OCR.</p>';
+    return;
+  }
+
+  if (activePdfModifiedViolationsData.length > 1) {
+    q('#multiViolationInfoInForm').style.display = 'block';
+  } else {
+    q('#multiViolationInfoInForm').style.display = 'none';
+  }
+  updateActivePdfViolationNavUI();
+
+  q('#prevViolationBtnInForm').onclick = () => changeActivePdfViolation(-1);
+  q('#nextViolationBtnInForm').onclick = () => changeActivePdfViolation(1);
+  q('#submitActiveTicketBtn').onclick = submitActiveTicketData;
+}
+
+function parseDateForInput(dateString) {
+  // ... (your existing function content)
+    if (!dateString || typeof dateString !== 'string') return null;
+    dateString = dateString.trim();
+    let year, month, day;
+    try {
+        let match = dateString.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+        if (match) { [ , year, month, day] = match.map(Number); }
+        else if ((match = dateString.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/))) { [ , month, day, year] = match.map(Number); }
+        else if ((match = dateString.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2})$/))) { [ , month, day, year] = match.map(Number); year += 2000; }
+        if (year && month && day && month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+            return `${year}-${month.toString().padStart(2, '0')}-${day.toString().padStart(2, '0')}`;
+        }
+    } catch (e) { console.error("Date parse error:", e); }
+    console.warn(`Could not parse date string "${dateString}" for input.`);
+    return dateString;
+}
+
+function parseTimeForInput(timeString) {
+  // ... (your existing function content)
+    if (!timeString || typeof timeString !== 'string') return null;
+    timeString = timeString.trim().toUpperCase();
+    let hours = null, minutes = null, seconds = 0;
+    try {
+        let match = timeString.match(/^(\d{1,2}):(\d{2}):(\d{2})$/);
+        if (match) { [ , hours, minutes, seconds] = match.map(Number); }
+        else if ((match = timeString.match(/^(\d{1,2}):(\d{2})$/))) { [ , hours, minutes] = match.map(Number); }
+        else if ((match = timeString.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?\s*([AP]M)$/))) {
+             hours = parseInt(match[1]); minutes = parseInt(match[2]); seconds = match[3] ? parseInt(match[3]) : 0;
+             const ampm = match[4];
+             if (ampm === "PM" && hours !== 12) hours += 12;
+             if (ampm === "AM" && hours === 12) hours = 0;
+        }
+        if (hours !== null && minutes !== null && hours >= 0 && hours <= 23 && minutes >= 0 && minutes <= 59 && seconds >= 0 && seconds <= 59) {
+            return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+        }
+    } catch (e) { console.error("Time parse error:", e); }
+    console.warn(`Could not parse time string "${timeString}" for input.`);
+    return timeString;
+}
+
+const fieldIdToOcrKeyMap = {
+    licensePlate: 'licensePlate', licensePlateState: 'licenseState',
+    violationDate: 'violationDate', violationTime: 'violationTime',
+    violationId: 'violationId', pinNumber: 'pinNumber',
+    issuingAgency: 'issuingAgency', violationType: 'violationType',
+    violationLocation: 'violationLocation', originalPenalty: 'originalPenaltyAmount',
+    additionalPenalty: 'additionalPenaltyAmount', notes: 'paymentWebsite',
+    dueDate: 'dueDate'
+};
+
+function populateFormForActivePdfViolation(index) {
+  // ... (your existing function content)
+  if (index < 0 || index >= activePdfModifiedViolationsData.length) return;
+  const violationData = activePdfModifiedViolationsData[index];
+
+  q('#formPaneContainer form').querySelectorAll('.auto-detected, .overridden').forEach(el => {
+    el.classList.remove('auto-detected', 'overridden');
+  });
+  q('#ocrOverrideWarningInForm').style.display = 'none';
+
+  for (const fieldId in fieldIdToOcrKeyMap) {
+    const ocrKey = fieldIdToOcrKeyMap[fieldId];
+    const field = q(`#${fieldId}`);
+    if (field) {
+      const rawValue = violationData[ocrKey];
+      let valueToSet = (rawValue !== undefined && rawValue !== null) ? String(rawValue) : '';
+
+      if (fieldId === 'violationDate' || fieldId === 'dueDate') {
+        valueToSet = parseDateForInput(valueToSet) || '';
+      } else if (fieldId === 'violationTime') {
+        valueToSet = parseTimeForInput(valueToSet) || '';
+      }
+      field.value = valueToSet;
+      if (valueToSet !== '') field.classList.add('auto-detected');
+    }
+  }
+}
+
+function updateActivePdfViolationNavUI() {
+  // ... (your existing function content)
+  const total = activePdfModifiedViolationsData.length;
+  q('#violationIndicatorInForm').textContent = `Violation ${activePdfCurrentViolationDisplayIndex + 1} of ${total}`;
+  q('#prevViolationBtnInForm').disabled = (activePdfCurrentViolationDisplayIndex === 0);
+  q('#nextViolationBtnInForm').disabled = (activePdfCurrentViolationDisplayIndex === total - 1);
+}
+
+function changeActivePdfViolation(direction) {
+  // ... (your existing function content)
+  updateModifiedViolationDataFromForm(activePdfCurrentViolationDisplayIndex);
+  const newIndex = activePdfCurrentViolationDisplayIndex + direction;
+  if (newIndex >= 0 && newIndex < activePdfModifiedViolationsData.length) {
+    activePdfCurrentViolationDisplayIndex = newIndex;
+    populateFormForActivePdfViolation(activePdfCurrentViolationDisplayIndex);
+    updateActivePdfViolationNavUI();
+  }
+}
+
+function updateModifiedViolationDataFromForm(indexToUpdate) {
+  // ... (your existing function content)
+    if (indexToUpdate < 0 || indexToUpdate >= activePdfModifiedViolationsData.length) return;
+    const currentViolationBeingModified = activePdfModifiedViolationsData[indexToUpdate];
+    
+    for (const fieldId in fieldIdToOcrKeyMap) {
+        const ocrKey = fieldIdToOcrKeyMap[fieldId];
+        const field = q(`#${fieldId}`);
+        if (field) {
+            currentViolationBeingModified[ocrKey] = field.value;
+        }
+    }
+}
+
+function markOverridden(inputElement) {
+  // ... (your existing function content)
+  inputElement.classList.remove('auto-detected');
+  inputElement.classList.add('overridden');
+  q('#ocrOverrideWarningInForm').style.display = 'block';
+}
+
+function submitActiveTicketData() {
+  // ... (your existing function content)
+  const submitBtn = q('#submitActiveTicketBtn');
+  const statusDiv = q('#statusInForm');
+
+  submitBtn.disabled = true;
+  submitBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Submitting...';
+  statusDiv.textContent = "Processing submission...";
+  statusDiv.style.color = "#3b82f6";
+
+  updateModifiedViolationDataFromForm(activePdfCurrentViolationDisplayIndex);
+  
+  const dataPackage = {
+    ticketPDF: activePdfFileUrl,
+    ticketFileId: activePdfFileId,
+    isLateNotice: q('#activePdfIsLateNoticeField').value === 'true',
+    violations: JSON.parse(JSON.stringify(activePdfModifiedViolationsData))
+  };
+
+  console.log("Submitting (Single PDF - All its violations) Data Package:", JSON.stringify(dataPackage, null, 2));
+
+  google.script.run
+    .withSuccessHandler(msg => {
+      statusDiv.textContent = msg || "Ticket data submitted successfully!";
+      statusDiv.style.color = "#22c55e";
+      submitBtn.innerHTML = '<i class="fas fa-check-circle"></i> Submitted!';
+      
+      const activeResult = allUploadedFileResults.find(r => r.originalIndex === activeCardIndex);
+      if(activeResult) {
+        activeResult.submitted = true;
+        activeResult.modifiedOcrData.violations = JSON.parse(JSON.stringify(activePdfModifiedViolationsData));
+        activeResult.modifiedOcrData.isLateNotice = (dataPackage.isLateNotice);
+      }
+
+      updateCardStatus(activeCardIndex, 'state-submitted', 'Submitted to Sheet');
+      if (activeCardElement) activeCardElement.onclick = () => activateCard(activeCardIndex);
+
+      const nextUnsubmittedIndex = allUploadedFileResults.findIndex(r => r.success && !r.submitted);
+      if (nextUnsubmittedIndex !== -1) {
+          setTimeout(() => activateCard(allUploadedFileResults[nextUnsubmittedIndex].originalIndex), 1500);
+      } else {
+          if(q('#submitAllReviewedBtn')) q('#submitAllReviewedBtn').style.display = 'none';
+          setTimeout(() => {
+              formPaneContainer.innerHTML = ''; formPaneContainer.appendChild(formPanePlaceholder); pdfPane.src='about:blank';
+              if(activeCardElement) activeCardElement.classList.remove('active-card');
+              activeCardIndex = -1; activeCardElement = null;
+              const allDone = allUploadedFileResults.every(r => r.submitted || !r.success);
+              if (allDone) {
+                 dropHint.classList.remove('hidden');
+                 dropHint.innerHTML = '<i class="fas fa-thumbs-up fa-2x" style="color:#22c55e; margin-bottom:8px;"></i><br>All processed tickets submitted!';
+              }
+          }, 2000);
+      }
+    })
+    .withFailureHandler(error => {
+      console.error("Submission Error:", error);
+      statusDiv.textContent = "Error: " + error.message;
+      statusDiv.style.color = "#ef4444";
+      submitBtn.disabled = false;
+      submitBtn.innerHTML = '<i class="fas fa-exclamation-triangle"></i> Retry Submission';
+    })
+    .addMultipleTicketData(dataPackage);
+}
+</script>
+</body>
+</html>
