@@ -5,43 +5,46 @@
 // ====================================================================
 // Constants & Configuration
 // ====================================================================
-const TARGET_SHEET_NAME = "Envoy Violations - New";
+const TARGET_SHEET_NAME = "Envoy Violations - New 2026";
 const FLEET_SHEET_ID = "1E5d_YhQAQVm52XEI6dH74U1n_YGtwpjLvPmm57oDbHE";
 const FLEET_SHEET_TAB_NAME = "Entire Fleet Overview";
 const TICKET_DRIVE_FOLDER_NAME = "Traffic Tickets"; // Or your preferred folder name
 const LOG_SHEET_NAME = "TicketProcessingLogs"; // Dedicated log sheet
 
-// Column Mapping for TARGET_SHEET_NAME (1-based index)
+// Column Mapping for TARGET_SHEET_NAME (1-based index) — matches "Envoy Violations - New 2026" layout
 const COL = {
-  VEHICLE: 1,                 // A: Looked up from Fleet Sheet
-  LICENSE_PLATE: 2,           // B*
-  LICENSE_PLATE_STATE: 3,     // C*
-  DATE_VIOLATION: 4,          // D*
-  TIME_VIOLATION: 5,          // E*
-  VIOLATION_ID: 6,            // F*
-  PIN_NUMBER: 7,              // G*
-  ISSUING_AGENCY: 8,          // H*
-  VIOLATION_TYPE: 9,          // I*
-  VIOLATION_LOCATION: 10,     // J*
-  RESPONSIBLE_DRIVER: 11,     // K: Looked up from DB
-  DRIVER_EMAIL: 12,           // L: Looked up from DB
-  BOOKING_ID: 13,             // M: Looked up from DB
-  PROPERTY: 14,               // N: Looked up from DB
-  PAYMENT_STATUS: 15,         // O: Manual/Other Process
-  DRIVER_BILLING_STATUS: 16,  // P: Manual/Other Process
-  ORIGINAL_PENALTY: 17,       // Q*
-  ADDITIONAL_PENALTY: 18,     // R*
-  PAYABLE_AMOUNT: 19,         // S: Calculated (Q + R)
-  NOTES: 20,                  // T* (Website, etc.)
-  DUE_DATE: 21,               // U*
-  PDF_LINK: 22,               // V: Drive link
-  // W, X, Y are currently unused in this mapping but exist conceptually
-  // Make sure your sheet actually has columns up to AA
-  EMAIL_STATUS: 26,           // Z: Set by email script
-  TOTAL_OWED_COLLECTIONS: 27  // AA: Set by payment script
+  VEHICLE: 1,                 // A: Envoy #
+  LICENSE_PLATE: 2,           // B: License Plate
+  LICENSE_PLATE_STATE: 3,     // C: State
+  DATE_VIOLATION: 4,          // D: Date
+  DUE_DATE: 5,                // E: Due Date
+  TIME_VIOLATION: 6,          // F: Time (check)
+  VIOLATION_ID: 7,            // G: Violation ID
+  BOOKING_ID: 8,              // H: Booking ID
+  PIN_NUMBER: 9,              // I: PIN Number
+  ISSUING_AGENCY: 10,         // J: Issuing Agency
+  VIOLATION_TYPE: 11,         // K: Violation Type
+  VIOLATION_LOCATION: 12,     // L: Violation Location
+  RESPONSIBLE_DRIVER: 13,     // M: Responsible Driver
+  DRIVER_EMAIL: 14,           // N: Driver Email
+  EMAIL_STATUS: 15,           // O: Driver Email Status
+  DRIVER_BILLING_STATUS: 16,  // P: Driver Billing Status
+  PROPERTY: 17,               // Q: Property
+  ORIGINAL_PENALTY: 18,       // R: Original (Billable) Amount
+  ADDITIONAL_PENALTY: 19,     // S: Penalty Amount
+  PAYABLE_AMOUNT: 20,         // T: Payable Amount
+  TOTAL_OWED_COLLECTIONS: 21, // U: Balance Due
+  // V: Toll or Ticket (not set by script)
+  // W: Subsidiary (not set by script)
+  // X: Recorded in bill.com (Accounting)
+  // Y: Paid by (Accounting)
+  // Z: Dispute Status (Accounting)
+  PAYMENT_STATUS: 27,         // AA: Payment Status (Sky)
+  NOTES: 28,                  // AB: Notes
+  PDF_LINK: 29                // AC: PDF
 };
-// IMPORTANT: Ensure your TARGET_SHEET_NAME actually has columns up to AA (27)
-const NUM_COLUMNS = 27; // Updated to include up to column AA
+// IMPORTANT: Ensure your TARGET_SHEET_NAME actually has columns up to AC (29)
+const NUM_COLUMNS = 29; // Updated to include up to column AC
 // In TicketProcessingv2-NeedsDebugging.gs.txt
 
 // In TicketProcessing.gs (THIS IS FILE B)
