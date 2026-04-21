@@ -1,0 +1,6 @@
+# Everything below is NOT pushed to Apps Script.
+# Only .gs, .html, and appsscript.json are pushed.
+**/**
+!*.gs
+!*.html
+!appsscript.json
