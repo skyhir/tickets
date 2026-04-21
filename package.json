@@ -1,0 +1,15 @@
+{
+  "name": "tickets",
+  "private": true,
+  "description": "Apps Script project for ticket upload, Gemini OCR, and sheet writes.",
+  "scripts": {
+    "login": "clasp login",
+    "pull": "clasp pull",
+    "push": "clasp push",
+    "push:watch": "clasp push --watch",
+    "open": "clasp open"
+  },
+  "devDependencies": {
+    "@google/clasp": "^3.3.0"
+  }
+}
