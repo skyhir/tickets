@@ -1332,6 +1332,88 @@ function notifyNewRow_(isToll, violationData, vehicleNumber, newRowIndex, pdfLin
 }
 
 /**
+ * On-demand export: scans the tickets sheet for historical toll-shaped rows
+ * and produces a CSV. Emails it to NEW_ROW_NOTIFY_EMAIL and also saves a
+ * timestamped copy to the user's Drive root. Does NOT modify the tickets
+ * sheet or current_tolls; this is read-only.
+ *
+ * "Toll-shaped" = column V says "Toll" (case-insensitive) OR the violation
+ * type / issuing agency / payment website triggers the same keyword match
+ * used by classifyIsToll_ at upload time.
+ *
+ * Invoked from the Add Ticket menu; safe to call any time.
+ */
+function exportHistoricalTollsCsv() {
+    const functionName = "exportHistoricalTollsCsv";
+    const ui = SpreadsheetApp.getUi();
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName(TARGET_SHEET_NAME);
+    if (!sheet) {
+        ui.alert(`Sheet "${TARGET_SHEET_NAME}" not found.`);
+        return;
+    }
+
+    const lastRow = sheet.getLastRow();
+    const lastCol = sheet.getLastColumn();
+    if (lastRow < 2) {
+        ui.alert("No data rows to export.");
+        return;
+    }
+
+    const range = sheet.getRange(1, 1, lastRow, lastCol).getValues();
+    const header = range[0];
+    const body   = range.slice(1);
+
+    const kwRe = /toll|ez-?pass|i-?pass|tollroad|good to go|drivek|statement fee|fastrak|sunpass|peach pass|mta bridges/i;
+    const tollRows = body.filter(r => {
+        const v  = String(r[COL.TOLL_OR_TICKET - 1] || '').trim().toLowerCase();
+        if (v === 'toll') return true;
+        if (v === 'ticket') return false;
+        const hay = [
+            r[COL.VIOLATION_TYPE - 1],
+            r[COL.ISSUING_AGENCY - 1],
+            r[COL.NOTES - 1]
+        ].filter(Boolean).join(' ');
+        return kwRe.test(hay);
+    });
+
+    logToSheet_(functionName, `Found ${tollRows.length} toll-shaped rows out of ${body.length} data rows`, "INFO");
+
+    const escapeCsv = v => {
+        if (v === null || v === undefined) return '';
+        const s = (v instanceof Date) ? Utilities.formatDate(v, Session.getScriptTimeZone(), "yyyy-MM-dd HH:mm:ss") : String(v);
+        return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+    };
+    const csvLines = [header.map(escapeCsv).join(',')];
+    tollRows.forEach(r => csvLines.push(r.map(escapeCsv).join(',')));
+    const csvContent = csvLines.join('\r\n');
+
+    const stamp = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyyMMdd_HHmmss");
+    const fileName = `historical_tolls_${stamp}.csv`;
+    const blob = Utilities.newBlob(csvContent, 'text/csv', fileName);
+    const file = DriveApp.createFile(blob);
+    const fileUrl = file.getUrl();
+    logToSheet_(functionName, `Wrote CSV to Drive: ${fileUrl}`, "INFO");
+
+    if (NEW_ROW_NOTIFY_EMAIL) {
+        try {
+            MailApp.sendEmail({
+                to: NEW_ROW_NOTIFY_EMAIL,
+                subject: `Historical tolls export — ${tollRows.length} rows`,
+                htmlBody: `<p>Scanned <b>${body.length}</b> rows in "${TARGET_SHEET_NAME}" and found <b>${tollRows.length}</b> toll-shaped rows.</p>`
+                        + `<p>Match rule: column V = "Toll", OR violation type / issuing agency / notes match a toll keyword.</p>`
+                        + `<p>CSV on Drive: <a href="${fileUrl}">${fileName}</a></p>`,
+                attachments: [blob]
+            });
+        } catch (mailErr) {
+            logToSheet_(functionName, `Email attachment failed: ${mailErr}`, "WARN");
+        }
+    }
+
+    ui.alert(`Historical tolls export complete.\n\n${tollRows.length} rows of ${body.length} scanned.\nCSV: ${fileName}\n\nEmailed to ${NEW_ROW_NOTIFY_EMAIL} and saved to your Drive root.`);
+}
+
+/**
  * One-time setup: ensure current_tolls has headers for columns S and T.
  * Run manually from the Apps Script editor after first deploy. Idempotent.
  */

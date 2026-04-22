@@ -9,6 +9,8 @@ function onOpen() {
     .addItem('Process Payment', 'processTicketPayments')
     .addItem('Email Drivers', 'emailDriversTicketNotifications')
     .addItem('Add a Ticket (Blink)', 'showAddTicketFormBlink')
+    .addSeparator()
+    .addItem('Export Historical Tolls → CSV', 'exportHistoricalTollsCsv')
     .addToUi();
   
 }
