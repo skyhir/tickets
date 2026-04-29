@@ -1174,6 +1174,18 @@ function appendAndFormatViolationRow_(violationData, pdfLink, isLateNotice) {
         }
     }
 
+    // Mark the tickets-sheet row's Driver Billing Status (col P) so reviewers
+    // see at a glance that customer billing is happening via the toll-processing
+    // sheet, not the normal Stripe-attempt flow on this sheet. Only set when
+    // routing actually succeeded; a failed route leaves col P blank for triage.
+    if (routedToTolls) {
+        try {
+            sheet.getRange(newRowIndex, COL.DRIVER_BILLING_STATUS).setValue("Transferred to Toll Sheet");
+        } catch (markErr) {
+            logToSheet_(functionName, `Failed to mark row ${newRowIndex} Driver Billing Status as 'Transferred to Toll Sheet': ${markErr}`, "WARN");
+        }
+    }
+
     // --- New-row email notification (never blocks row append) ---
     try {
         notifyNewRow_(isToll, violationData, rowData[COL.VEHICLE - 1] || '', newRowIndex, pdfLink, routedToTolls);
