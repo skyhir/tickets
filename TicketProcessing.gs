@@ -944,6 +944,8 @@ Example (Parking Ticket — non-toll):
             // Ensure amounts are numbers
             violation.originalPenaltyAmount = parseFloat(violation.originalPenaltyAmount) || 0;
             violation.additionalPenaltyAmount = parseFloat(violation.additionalPenaltyAmount) || 0;
+            // Split state out of plate when Gemini merged them ("FL 22DWCE" -> plate "22DWCE", state "FL").
+            normalizePlateAndState_(violation);
             // Add more validation per violation if needed (e.g., date/time string format checks could go here)
         });
     }
@@ -1053,6 +1055,9 @@ function appendAndFormatViolationRow_(violationData, pdfLink, isLateNotice) {
     const rowData = new Array(NUM_COLUMNS).fill('');
 
     // --- Populate from Violation Data & Apply Transformations ---
+    // Final defense: catch the "plate field contains state code" pattern even if
+    // OCR-side normalization was skipped or an admin pasted a merged value.
+    normalizePlateAndState_(violationData);
     rowData[COL.LICENSE_PLATE - 1] = violationData.licensePlate;
     rowData[COL.LICENSE_PLATE_STATE - 1] = abbreviateState_(violationData.licenseState);
 
@@ -1463,8 +1468,15 @@ function getVehicleNumberFromFleetSheet_(licensePlate) {
 
   // --- Plate Cleaning ---
   let cleanedPlate = licensePlate.trim().toUpperCase();
-  // Regex: Matches a space followed by exactly 2 capital letters at the end of the string
-  cleanedPlate = cleanedPlate.replace(/ ([A-Z]{2})$/, '');
+  // Strip a trailing 2-letter state code (e.g. "22DWCE FL"), only when the code is a known US/CA state.
+  cleanedPlate = cleanedPlate.replace(/[\s\-_/\.]+([A-Z]{2})$/, function(_, code) {
+    return VALID_STATE_CODES_[code] ? '' : _;
+  });
+  // Strip a leading 2-letter state code (e.g. "FL 22DWCE", "FL-22DWCE").
+  cleanedPlate = cleanedPlate.replace(/^([A-Z]{2})[\s\-_/\.]+/, function(_, code) {
+    return VALID_STATE_CODES_[code] ? '' : _;
+  });
+  cleanedPlate = cleanedPlate.trim();
   logToSheet_(functionName, `Original Plate: "${licensePlate}", Cleaned Plate for Lookup: "${cleanedPlate}"`, "DEBUG");
   // --- End Plate Cleaning ---
 
@@ -1993,6 +2005,65 @@ function abbreviateState_(stateName) {
   };
   // Return abbreviation if found in map, otherwise return original (if already abbr) or original
   return stateMap[name] || (name.length === 2 ? name : stateName.toUpperCase()); // Ensure return is uppercase
+}
+
+
+const VALID_STATE_CODES_ = (function() {
+  const set = {};
+  ["AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID","IL","IN","IA",
+   "KS","KY","LA","ME","MD","MA","MI","MN","MS","MO","MT","NE","NV","NH","NJ",
+   "NM","NY","NC","ND","OH","OK","OR","PA","RI","SC","SD","TN","TX","UT","VT",
+   "VA","WA","WV","WI","WY","DC",
+   "AB","BC","MB","NB","NL","NS","ON","PE","QC","SK"
+  ].forEach(function(c) { set[c] = true; });
+  return set;
+})();
+
+/**
+ * Detects when a license plate field also contains the state code (e.g. Gemini
+ * returned "FL 22DWCE" instead of "22DWCE"). Strips the leading or trailing
+ * state token from `licensePlate` and back-fills `licenseState` if missing or
+ * already in agreement. Mutates `violationData` in place. No-op otherwise.
+ */
+function normalizePlateAndState_(violationData) {
+  if (!violationData) return;
+  const rawPlate = violationData.licensePlate;
+  if (typeof rawPlate !== 'string') return;
+  const trimmed = rawPlate.trim();
+  if (!trimmed) return;
+  const upper = trimmed.toUpperCase();
+
+  let detectedState = null;
+  let strippedPlate = null;
+
+  // Leading state: "FL 22DWCE", "FL-22DWCE", "FL/22DWCE"
+  let m = upper.match(/^([A-Z]{2})[\s\-_/\.]+(.+)$/);
+  if (m && VALID_STATE_CODES_[m[1]]) {
+    detectedState = m[1];
+    strippedPlate = m[2].trim();
+  } else {
+    // Trailing state: "22DWCE FL"
+    m = upper.match(/^(.+?)[\s\-_/\.]+([A-Z]{2})$/);
+    if (m && VALID_STATE_CODES_[m[2]]) {
+      detectedState = m[2];
+      strippedPlate = m[1].trim();
+    }
+  }
+
+  if (!detectedState || !strippedPlate) return;
+  // Stripped remainder must still look like a plate (>=2 alphanumerics).
+  if (!/[A-Z0-9]{2,}/.test(strippedPlate)) return;
+
+  violationData.licensePlate = strippedPlate;
+  const existingStateAbbr = abbreviateState_(violationData.licenseState || '');
+  if (!existingStateAbbr || existingStateAbbr === detectedState) {
+    violationData.licenseState = detectedState;
+  }
+  try {
+    logToSheet_("normalizePlateAndState_",
+      `Split plate "${rawPlate}" -> plate="${strippedPlate}", state="${detectedState}" (existing state field was "${violationData.licenseState || ''}")`,
+      "INFO");
+  } catch (e) { /* logging is best-effort */ }
 }
 
 
