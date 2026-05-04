@@ -31,10 +31,10 @@ function processTicketPayments() {
   logToSheet_(functionName, "Starting payment processing run.", "INFO");
 
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = ss.getSheetByName(TARGET_SHEET_NAME);
-  if (!sheet) {
-    ui.alert("Error: Target sheet '" + TARGET_SHEET_NAME + "' not found.");
-    logToSheet_(functionName, "Sheet not found.", "ERROR");
+  const sheets = getViolationsSheets_(ss);
+  if (sheets.length === 0) {
+    ui.alert(`Error: Neither target sheet ('${TARGET_SHEET_NAME}' or '${TOLL_TARGET_SHEET_NAME}') was found.`);
+    logToSheet_(functionName, "No target sheets found.", "ERROR");
     return;
   }
 
@@ -47,37 +47,28 @@ function processTicketPayments() {
   const originalPenaltyColIndex = COL.ORIGINAL_PENALTY - 1;
   const totalOwedCol = COL.TOTAL_OWED_COLLECTIONS; // Column AA
 
-  let successCount = 0;
-  let collectionCount = 0;
-  let errorCount = 0;
-
-  // --- Get All Data Once ---
-  const dataRange = sheet.getDataRange();
-  const allData = dataRange.getValues();
-  const numDataRows = allData.length - headerRows;
-  logToSheet_(functionName, `Read ${allData.length} total rows (${numDataRows} data rows) from sheet.`, "DEBUG");
-
-  // --- ** FILTER DATA FIRST ** ---
+  // --- Filter Attempt rows across every violations tab first ---
+  // Each item carries its sheet so updates write back to the tab the row came from.
   const rowsToProcess = [];
-  for (let i = headerRows; i < allData.length; i++) {
-    const rowData = allData[i];
-    // Basic check for row validity and status column existence
-    if (!rowData || rowData.length <= billingStatusColIndex) {
-        logToSheet_(functionName, `Row ${i + 1}: Skipping pre-filter check - Row is invalid or too short.`, "WARN");
+  for (const sheet of sheets) {
+    const allData = sheet.getDataRange().getValues();
+    logToSheet_(functionName, `Read ${allData.length} total rows from "${sheet.getName()}".`, "DEBUG");
+    for (let i = headerRows; i < allData.length; i++) {
+      const rowData = allData[i];
+      if (!rowData || rowData.length <= billingStatusColIndex) {
+        logToSheet_(functionName, `"${sheet.getName()}" Row ${i + 1}: Skipping pre-filter check - Row is invalid or too short.`, "WARN");
         continue;
-    }
-    const statusRaw = rowData[billingStatusColIndex];
-    const statusProcessed = String(statusRaw).trim().toUpperCase();
-
-    if (statusProcessed === "ATTEMPT") {
-      // Store the row data AND its original 1-based row number
-      rowsToProcess.push({ data: rowData, originalRowIndex: i + 1 });
+      }
+      const statusRaw = rowData[billingStatusColIndex];
+      const statusProcessed = String(statusRaw).trim().toUpperCase();
+      if (statusProcessed === "ATTEMPT") {
+        rowsToProcess.push({ sheet: sheet, data: rowData, originalRowIndex: i + 1 });
+      }
     }
   }
-  // --- ** End Filtering ** ---
 
   const numRowsToProcess = rowsToProcess.length;
-  logToSheet_(functionName, `Found ${numRowsToProcess} row(s) with status 'Attempt' in Column ${String.fromCharCode(65 + billingStatusColIndex)}.`, "INFO");
+  logToSheet_(functionName, `Found ${numRowsToProcess} row(s) with status 'Attempt' across ${sheets.length} tab(s).`, "INFO");
 
   if (numRowsToProcess === 0) {
     logToSheet_(functionName, "No rows found requiring payment processing.", "INFO");
@@ -94,64 +85,69 @@ function processTicketPayments() {
   }
   logToSheet_(functionName, "Stripe key retrieved successfully.", "INFO");
 
+  let successCount = 0;
+  let collectionCount = 0;
+  let errorCount = 0;
+
   // --- ** Process ONLY the Filtered Rows ** ---
   for (let j = 0; j < rowsToProcess.length; j++) {
     const item = rowsToProcess[j];
+    const sheet = item.sheet;
     const row = item.data; // The actual row data array
     const actualRowNum = item.originalRowIndex; // The original row number on the sheet
 
-    logToSheet_(functionName, `Processing filtered row ${j + 1} of ${numRowsToProcess} (Sheet Row ${actualRowNum}). Status: 'Attempt'.`, "INFO");
+    logToSheet_(functionName, `Processing filtered row ${j + 1} of ${numRowsToProcess} ("${sheet.getName()}" Row ${actualRowNum}). Status: 'Attempt'.`, "INFO");
 
     const bookingId = row[bookingIdColIndex];
     const originalPenalty = parseFloat(row[originalPenaltyColIndex]) || 0;
 
     // Validate required data
     if (!bookingId || originalPenalty < 0) {
-      logToSheet_(functionName, `Sheet Row ${actualRowNum}: Skipping payment - Missing Booking ID ('${bookingId}') or negative Original Penalty ($${originalPenalty}).`, "WARN");
+      logToSheet_(functionName, `"${sheet.getName()}" Row ${actualRowNum}: Skipping payment - Missing Booking ID ('${bookingId}') or negative Original Penalty ($${originalPenalty}).`, "WARN");
       sheet.getRange(actualRowNum, COL.DRIVER_BILLING_STATUS).setValue("Error - Missing/Invalid Data");
       errorCount++;
       continue; // Go to next filtered row
     }
 
     // Lookup Stripe Customer ID
-    logToSheet_(functionName, `Sheet Row ${actualRowNum}: Looking up Stripe ID for Booking ID ${bookingId}...`, "DEBUG");
+    logToSheet_(functionName, `"${sheet.getName()}" Row ${actualRowNum}: Looking up Stripe ID for Booking ID ${bookingId}...`, "DEBUG");
     sheet.getRange(actualRowNum, COL.DRIVER_BILLING_STATUS).setValue("Processing Payment..."); // Update status on sheet
     SpreadsheetApp.flush();
 
     const stripeCustomerId = getStripeCustomerIdFromBooking_(bookingId);
 
     if (!stripeCustomerId || typeof stripeCustomerId !== 'string' || !stripeCustomerId.startsWith('cus_')) {
-        logToSheet_(functionName, `Sheet Row ${actualRowNum}: Stripe Customer ID lookup failed or invalid for Booking ID ${bookingId}. Result: ${stripeCustomerId}`, "ERROR");
+        logToSheet_(functionName, `"${sheet.getName()}" Row ${actualRowNum}: Stripe Customer ID lookup failed or invalid for Booking ID ${bookingId}. Result: ${stripeCustomerId}`, "ERROR");
         sheet.getRange(actualRowNum, COL.DRIVER_BILLING_STATUS).setValue("Error - No Stripe ID");
 
         let adminFeeOnFailure = 25.00;
         if (stripeCustomerId === TEST_CUSTOMER_ID) { // Check even if format is wrong, maybe ID was returned
            adminFeeOnFailure = 0.00;
-           logToSheet_(functionName, `Sheet Row ${actualRowNum}: Waiving $25 admin fee for TEST_CUSTOMER_ID during Stripe ID lookup failure.`, "INFO");
+           logToSheet_(functionName, `"${sheet.getName()}" Row ${actualRowNum}: Waiving $25 admin fee for TEST_CUSTOMER_ID during Stripe ID lookup failure.`, "INFO");
         }
         const totalOwed = originalPenalty + adminFeeOnFailure;
 
         if (totalOwedCol && totalOwedCol > 0 && totalOwedCol <= sheet.getMaxColumns()) {
            sheet.getRange(actualRowNum, totalOwedCol).setValue(totalOwed).setNumberFormat("$#,##0.00");
         } else {
-           logToSheet_(functionName, `Sheet Row ${actualRowNum}: Invalid TOTAL_OWED_COLLECTIONS column index (${totalOwedCol}). Cannot write owed amount.`, "ERROR");
+           logToSheet_(functionName, `"${sheet.getName()}" Row ${actualRowNum}: Invalid TOTAL_OWED_COLLECTIONS column index (${totalOwedCol}). Cannot write owed amount.`, "ERROR");
         }
         errorCount++;
         continue; // Go to next filtered row
     }
-    logToSheet_(functionName, `Sheet Row ${actualRowNum}: Found Stripe Customer ID: ${stripeCustomerId}`, "DEBUG");
+    logToSheet_(functionName, `"${sheet.getName()}" Row ${actualRowNum}: Found Stripe Customer ID: ${stripeCustomerId}`, "DEBUG");
 
     // Fee Waiver Logic
     let adminFee = 25.00;
     if (stripeCustomerId === TEST_CUSTOMER_ID) {
         adminFee = 0.00;
-        logToSheet_(functionName, `Sheet Row ${actualRowNum}: Waiving $25 admin fee for test customer ${TEST_CUSTOMER_ID}.`, "INFO");
+        logToSheet_(functionName, `"${sheet.getName()}" Row ${actualRowNum}: Waiving $25 admin fee for test customer ${TEST_CUSTOMER_ID}.`, "INFO");
     }
 
     // Calculate amount and handle $0 cases
     const amountToCharge = originalPenalty + adminFee;
      if (amountToCharge <= 0 && originalPenalty <= 0) {
-       logToSheet_(functionName, `Sheet Row ${actualRowNum}: Calculated amount is $${amountToCharge.toFixed(2)}. Skipping charge attempt for non-positive amount. Marking as 'Paid (Amount $0)'.`, "WARN");
+       logToSheet_(functionName, `"${sheet.getName()}" Row ${actualRowNum}: Calculated amount is $${amountToCharge.toFixed(2)}. Skipping charge attempt for non-positive amount. Marking as 'Paid (Amount $0)'.`, "WARN");
        sheet.getRange(actualRowNum, COL.DRIVER_BILLING_STATUS).setValue("Paid (Amount $0)");
        if (totalOwedCol && totalOwedCol > 0 && totalOwedCol <= sheet.getMaxColumns()) {
          sheet.getRange(actualRowNum, totalOwedCol).setValue(0).setNumberFormat("$#,##0.00");
@@ -163,24 +159,24 @@ function processTicketPayments() {
     // Attempt Stripe Charge
     const amountInCents = Math.round(amountToCharge * 100);
     const description = `52065 Vehicle Toll Roads/Citations/Impound: Booking ${bookingId}`;
-    logToSheet_(functionName, `Sheet Row ${actualRowNum}: Attempting Stripe charge for $${amountToCharge.toFixed(2)} (${amountInCents} cents)...`, "DEBUG");
+    logToSheet_(functionName, `"${sheet.getName()}" Row ${actualRowNum}: Attempting Stripe charge for $${amountToCharge.toFixed(2)} (${amountInCents} cents)...`, "DEBUG");
     const paymentResult = attemptStripeCharge_(stripeKey, stripeCustomerId, amountInCents, description);
 
     // Update Sheet Based on Result
     if (paymentResult.success) {
-      logToSheet_(functionName, `Sheet Row ${actualRowNum}: Payment successful. PI ID: ${paymentResult.paymentIntentId}`, "SUCCESS");
+      logToSheet_(functionName, `"${sheet.getName()}" Row ${actualRowNum}: Payment successful. PI ID: ${paymentResult.paymentIntentId}`, "SUCCESS");
       sheet.getRange(actualRowNum, COL.DRIVER_BILLING_STATUS).setValue("Paid");
       if (totalOwedCol && totalOwedCol > 0 && totalOwedCol <= sheet.getMaxColumns()) {
         sheet.getRange(actualRowNum, totalOwedCol).setValue(0).setNumberFormat("$#,##0.00");
       }
       successCount++;
     } else {
-      logToSheet_(functionName, `Sheet Row ${actualRowNum}: Payment failed. Reason: ${paymentResult.message}`, "WARN");
+      logToSheet_(functionName, `"${sheet.getName()}" Row ${actualRowNum}: Payment failed. Reason: ${paymentResult.message}`, "WARN");
       sheet.getRange(actualRowNum, COL.DRIVER_BILLING_STATUS).setValue("Collections");
        if (totalOwedCol && totalOwedCol > 0 && totalOwedCol <= sheet.getMaxColumns()) {
           sheet.getRange(actualRowNum, totalOwedCol).setValue(amountToCharge).setNumberFormat("$#,##0.00");
        } else {
-           logToSheet_(functionName, `Sheet Row ${actualRowNum}: Invalid TOTAL_OWED_COLLECTIONS column index (${totalOwedCol}). Cannot write owed amount.`, "ERROR");
+           logToSheet_(functionName, `"${sheet.getName()}" Row ${actualRowNum}: Invalid TOTAL_OWED_COLLECTIONS column index (${totalOwedCol}). Cannot write owed amount.`, "ERROR");
        }
       collectionCount++;
     }

@@ -6,6 +6,9 @@
 // Constants & Configuration
 // ====================================================================
 const TARGET_SHEET_NAME = "Envoy Violations - New 2026";
+// Tickets land on TARGET_SHEET_NAME; tolls (isToll == true) land on TOLL_TARGET_SHEET_NAME.
+// Same 29-column schema, so payment processing + driver emails iterate both tabs.
+const TOLL_TARGET_SHEET_NAME = "Envoy Violations - Tolls 2026";
 const FLEET_SHEET_ID = "1E5d_YhQAQVm52XEI6dH74U1n_YGtwpjLvPmm57oDbHE";
 const FLEET_SHEET_TAB_NAME = "Entire Fleet Overview";
 const TICKET_DRIVE_FOLDER_NAME = "Traffic Tickets"; // Or your preferred folder name
@@ -14,6 +17,32 @@ const LOG_SHEET_NAME = "TicketProcessingLogs"; // Dedicated log sheet
 // Cross-project toll routing
 const TOLL_PROCESSING_SHEET_ID = "1NLp7cqIY9At7TOCDq7cQ_ucH-rC6xADaXYvt3Jv5tGg";
 const TOLL_CURRENT_SHEET_NAME = "current_tolls";
+
+/**
+ * Returns the destination tab on the active spreadsheet for a row, based on
+ * isToll. Single source of truth for batch + single-add upload routing.
+ */
+function getDestinationSheet_(ss, isToll) {
+  const name = isToll ? TOLL_TARGET_SHEET_NAME : TARGET_SHEET_NAME;
+  const sheet = ss.getSheetByName(name);
+  if (!sheet) {
+    throw new Error(`Destination sheet "${name}" not found. Tickets/Tolls split assumes both tabs exist.`);
+  }
+  return sheet;
+}
+
+/**
+ * Returns [ticketsSheet, tollsSheet] (skipping any missing tab). Used by
+ * payment processing + driver email scans so both tabs are walked uniformly.
+ */
+function getViolationsSheets_(ss) {
+  const out = [];
+  const ticketsSheet = ss.getSheetByName(TARGET_SHEET_NAME);
+  if (ticketsSheet) out.push(ticketsSheet);
+  const tollsSheet = ss.getSheetByName(TOLL_TARGET_SHEET_NAME);
+  if (tollsSheet) out.push(tollsSheet);
+  return out;
+}
 
 // New-row notification recipient (per-row email on every upload)
 const NEW_ROW_NOTIFY_EMAIL = "sky@envoythere.com";
@@ -1130,12 +1159,9 @@ function appendAndFormatViolationRow_(violationData, pdfLink, isLateNotice) {
     rowData[COL.PAYMENT_STATUS - 1] = '';
     rowData[COL.DRIVER_BILLING_STATUS - 1] = '';
 
-    // --- Write to Target Sheet ---
+    // --- Write to Target Sheet (tolls → Tolls tab, tickets → New tab) ---
     const ss = SpreadsheetApp.getActiveSpreadsheet();
-    const sheet = ss.getSheetByName(TARGET_SHEET_NAME);
-    if (!sheet) {
-      throw new Error(`Target sheet "${TARGET_SHEET_NAME}" not found.`);
-    }
+    const sheet = getDestinationSheet_(ss, isToll);
     // Consider batching appends if performance is still an issue
     sheet.appendRow(rowData);
     const newRowIndex = sheet.getLastRow();
@@ -1174,9 +1200,9 @@ function appendAndFormatViolationRow_(violationData, pdfLink, isLateNotice) {
         }
     }
 
-    // Mark the tickets-sheet row's Driver Billing Status (col P) so reviewers
-    // see at a glance that customer billing is happening via the toll-processing
-    // sheet, not the normal Stripe-attempt flow on this sheet. Only set when
+    // Mark the tolls-tab row's Driver Billing Status (col P) so reviewers see
+    // at a glance that customer billing is happening via the toll-processing
+    // spreadsheet, not the Stripe-attempt flow on this sheet. Only set when
     // routing actually succeeded; a failed route leaves col P blank for triage.
     if (routedToTolls) {
         try {
@@ -1324,10 +1350,12 @@ function notifyNewRow_(isToll, violationData, vehicleNumber, newRowIndex, pdfLin
 
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     const ssId = ss ? ss.getId() : '';
-    const rowUrl = (ssId && newRowIndex) ? `https://docs.google.com/spreadsheets/d/${ssId}/edit#gid=0&range=A${newRowIndex}` : '';
-
+    const destSheetName = isToll ? TOLL_TARGET_SHEET_NAME : TARGET_SHEET_NAME;
+    const destSheet = ss ? ss.getSheetByName(destSheetName) : null;
+    const destGid = destSheet ? destSheet.getSheetId() : 0;
+    const rowUrl = (ssId && newRowIndex) ? `https://docs.google.com/spreadsheets/d/${ssId}/edit#gid=${destGid}&range=A${newRowIndex}` : '';
     const lines = [
-        `<p><b>${isToll ? 'Toll' : 'Ticket'}</b> logged to "${TARGET_SHEET_NAME}" (row ${newRowIndex})</p>`,
+        `<p><b>${isToll ? 'Toll' : 'Ticket'}</b> logged to "${destSheetName}" (row ${newRowIndex})</p>`,
         `<p>Plate: ${plate}${state ? ' (' + state + ')' : ''} · Envoy #: ${vehicleNumber || 'N/A'}</p>`,
         `<p>When: ${date} ${time}</p>`,
         agency ? `<p>Issuing agency: ${agency}</p>` : '',
