@@ -8,15 +8,13 @@ function emailDriversTicketNotifications() {
   logToSheet_(functionName, "Starting email notification run.", "INFO");
 
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = ss.getSheetByName(TARGET_SHEET_NAME);
-  if (!sheet) {
-    ui.alert("Error: Target sheet '" + TARGET_SHEET_NAME + "' not found.");
-    logToSheet_(functionName, "Sheet not found.", "ERROR");
+  const sheets = getViolationsSheets_(ss);
+  if (sheets.length === 0) {
+    ui.alert(`Error: Neither target sheet ('${TARGET_SHEET_NAME}' or '${TOLL_TARGET_SHEET_NAME}') was found.`);
+    logToSheet_(functionName, "No target sheets found.", "ERROR");
     return;
   }
 
-  const dataRange = sheet.getDataRange();
-  const data = dataRange.getValues();
   const headerRows = 1;
   const emailStatusColIndex = COL.EMAIL_STATUS - 1;
   const driverEmailColIndex = COL.DRIVER_EMAIL - 1;
@@ -49,7 +47,13 @@ function emailDriversTicketNotifications() {
   let processedCount = 0;
   let sentCount = 0;
   let errorCount = 0;
-  let sheetUpdates = []; // Batch status updates
+
+  // Walk every violations tab (tickets + tolls). Each tab gets its own batch
+  // queue so writes go back to the correct sheet.
+  for (const sheet of sheets) {
+  const data = sheet.getDataRange().getValues();
+  let sheetUpdates = []; // Batch status updates for this sheet
+  logToSheet_(functionName, `Scanning "${sheet.getName()}" (${data.length} rows) for Ready emails.`, "DEBUG");
 
   // --- Iterate through rows (skip header) ---
   for (let i = headerRows; i < data.length; i++) {
@@ -215,17 +219,18 @@ function emailDriversTicketNotifications() {
 
   } // --- End row loop ---
 
-  // --- Apply Batch Updates ---
+  // --- Apply Batch Updates (per-sheet) ---
    if (sheetUpdates.length > 0) {
-      logToSheet_(functionName, `Applying ${sheetUpdates.length} batch status updates to the sheet...`, "INFO");
+      logToSheet_(functionName, `Applying ${sheetUpdates.length} batch status updates to "${sheet.getName()}"...`, "INFO");
       sheetUpdates.forEach(update => {
           sheet.getRange(update.row, update.col).setValue(update.value);
       });
-      SpreadsheetApp.flush(); // Flush once after all updates are applied
-      logToSheet_(functionName, "Batch status updates applied.", "DEBUG");
+      SpreadsheetApp.flush();
+      logToSheet_(functionName, `Batch status updates applied to "${sheet.getName()}".`, "DEBUG");
   } else {
-       logToSheet_(functionName, "No email status updates needed.", "INFO");
+       logToSheet_(functionName, `No email status updates needed for "${sheet.getName()}".`, "INFO");
   }
+  } // --- End per-sheet loop ---
 
 
    logToSheet_(functionName, `Email notification run complete. Processed: ${processedCount}, Sent: ${sentCount}, Errors: ${errorCount}`, "INFO");
