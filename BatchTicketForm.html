@@ -180,6 +180,13 @@ let activePdfIsLateNotice = false;
 let activePdfFileUrl = '';
 let activePdfFileId = '';
 let activeCardElement = null;
+// Monotonic id for cards. New batches dropped during an in-flight batch get
+// fresh ids so they never collide with cards from prior batches.
+let nextOriginalIndex = 0;
+// Bumped on every activateCard call. Async work (iframe src set in rAF,
+// post-submit auto-advance setTimeout) checks the token to bail out when the
+// user has already navigated elsewhere.
+let activationGeneration = 0;
 
 // DOM Element constants - will be assigned in window.onload
 let fileInput, dropZone, dropHint, fileCardsContainer, pdfPane, formPaneContainer, formPanePlaceholder;
@@ -285,9 +292,12 @@ window.onload = function() {
   });
   
   if (fileInput) {
-    fileInput.onchange = function(e) { // Changed to function(e) for clarity
+    fileInput.onchange = function(e) {
         console.log("fileInput changed");
         const files = [...e.target.files].filter(f => f.type === 'application/pdf');
+        // Reset value so re-picking the same file fires change again, and so
+        // a follow-up pick during an in-flight batch is not suppressed.
+        e.target.value = '';
         if (!files.length) return;
         uploadAndProcessBatch(files);
     };
@@ -302,25 +312,28 @@ window.onload = function() {
 // Based on your provided full HTML, they are global functions, so they should remain outside window.onload.
 
 function uploadAndProcessBatch(files) {
-  // ... (your existing function content)
   console.log("uploadAndProcessBatch called with files:", files);
   dropHint.classList.add('hidden');
-  fileCardsContainer.innerHTML = ""; // Clear previous cards
-  allUploadedFileResults = [];
-  activeCardIndex = -1;
-  formPaneContainer.innerHTML = ''; // Clear form pane
-  formPaneContainer.appendChild(formPanePlaceholder); // Show placeholder
-  pdfPane.src = 'about:blank';
+  // NB: do NOT reset cards / results / active state here. Files dropped during
+  // an in-flight batch must append to the queue, not erase prior work.
 
+  // Allocate a stable, unique originalIndex per file in this batch. Each card's
+  // DOM id is `card-${originalIndex}` so the global counter prevents collisions
+  // when batches overlap.
+  const batchOriginalIndices = files.map(file => {
+    const originalIndex = nextOriginalIndex++;
+    addCard(originalIndex, file.name, 'state-pending', 'Queued for upload...');
+    return originalIndex;
+  });
 
-  const fileDataPromises = files.map((file, index) => {
-    addCard(index, file.name, 'state-pending', 'Queued for upload...');
+  const fileDataPromises = files.map((file, idxInBatch) => {
+    const originalIndex = batchOriginalIndices[idxInBatch];
     return new Promise(resolve => {
       const reader = new FileReader();
-      reader.onload = e_reader => resolve({ name: file.name, data: e_reader.target.result.split(',')[1], mimeType: file.type, originalIndex: index });
+      reader.onload = e_reader => resolve({ name: file.name, data: e_reader.target.result.split(',')[1], mimeType: file.type, originalIndex: originalIndex });
       reader.onerror = () => {
-        updateCardStatus(index, 'state-error', `Error reading file: ${file.name}`);
-        resolve({ name: file.name, error: true, originalIndex: index, message: 'File read error' });
+        updateCardStatus(originalIndex, 'state-error', `Error reading file: ${file.name}`);
+        resolve({ name: file.name, error: true, originalIndex: originalIndex, message: 'File read error' });
       };
       reader.readAsDataURL(file);
     });
@@ -337,8 +350,13 @@ function uploadAndProcessBatch(files) {
         updateCardStatus(fd.originalIndex, 'state-processing', 'Uploading & Analyzing...');
     });
 
+    // Server returns res.index as a per-call 0-based position. Capture this
+    // batch's originalIndex array so the success handler can translate
+    // res.index back to the right card without colliding with concurrent batches.
+    const validOriginalIndicesByPos = validFilesToProcess.map(fd => fd.originalIndex);
+
     google.script.run
-      .withSuccessHandler(renderBatchResults)
+      .withSuccessHandler(summary => appendBatchResults(validOriginalIndicesByPos, summary))
       .withFailureHandler(err => {
         console.error("Batch Upload/Analysis Error:", err);
         validFilesToProcess.forEach(fd => {
@@ -386,43 +404,59 @@ function updateCardStatus(originalIndex, statusClass, statusText) {
   card.classList.add(statusClass);
 }
 
-function renderBatchResults(summary) {
-  // ... (your existing function content)
-  console.log("Batch results received:", summary);
-  allUploadedFileResults = summary.results.map((res, i) => {
-      const cardData = {
-          originalIndex: res.index,
-          name: res.name || `File ${res.index + 1}`,
-          success: res.success,
-          fileUrl: res.fileUrl,
-          fileId: res.fileId,
-          ocrData: res.ocrData || { isLateNotice: false, violations: [] },
-          message: res.message,
-          submitted: false,
-          reviewedSinceLoad: false
-      };
-      cardData.modifiedOcrData = JSON.parse(JSON.stringify(cardData.ocrData));
-      const cardIdToUpdate = res.index;
+function appendBatchResults(batchOriginalIndices, summary) {
+  console.log("Batch results received:", summary, "for indices:", batchOriginalIndices);
+  // Translate server's per-call res.index → this batch's globally-unique
+  // originalIndex, then merge into allUploadedFileResults rather than replacing
+  // (so concurrent / sequential batches don't wipe each other).
+  const firstOkInBatch = [];
+  summary.results.forEach(res => {
+    const originalIndex = batchOriginalIndices[res.index];
+    if (originalIndex === undefined) {
+      console.warn("Server returned result for unknown batch position", res.index);
+      return;
+    }
+    const cardData = {
+      originalIndex: originalIndex,
+      name: res.name || `File ${originalIndex + 1}`,
+      success: res.success,
+      fileUrl: res.fileUrl,
+      fileId: res.fileId,
+      ocrData: res.ocrData || { isLateNotice: false, violations: [] },
+      message: res.message,
+      submitted: false,
+      reviewedSinceLoad: false
+    };
+    cardData.modifiedOcrData = JSON.parse(JSON.stringify(cardData.ocrData));
 
-      if (res.success) {
-        updateCardStatus(cardIdToUpdate, 'state-complete', 'Ready for Review');
-        const card = q(`#card-${cardIdToUpdate}`);
-        if(card) {
-            card.dataset.fileUrl = cardData.fileUrl;
-            card.dataset.fileId = cardData.fileId;
-        }
-      } else {
-        updateCardStatus(cardIdToUpdate, 'state-error', res.message || 'Analysis Failed');
+    // If a card with this index already exists in state (shouldn't normally,
+    // but be defensive), replace; otherwise append.
+    const existingIdx = allUploadedFileResults.findIndex(r => r.originalIndex === originalIndex);
+    if (existingIdx >= 0) allUploadedFileResults[existingIdx] = cardData;
+    else allUploadedFileResults.push(cardData);
+
+    if (res.success) {
+      updateCardStatus(originalIndex, 'state-complete', 'Ready for Review');
+      const card = q(`#card-${originalIndex}`);
+      if (card) {
+        card.dataset.fileUrl = cardData.fileUrl;
+        card.dataset.fileId = cardData.fileId;
       }
-      return cardData;
+      if (!cardData.submitted) firstOkInBatch.push(originalIndex);
+    } else {
+      updateCardStatus(originalIndex, 'state-error', res.message || 'Analysis Failed');
+    }
   });
 
-  const firstOkIndex = allUploadedFileResults.findIndex(r => r.success && !r.submitted);
-  if (firstOkIndex !== -1) {
-    activateCard(allUploadedFileResults[firstOkIndex].originalIndex);
-    if (q('#submitAllReviewedBtn')) q('#submitAllReviewedBtn').style.display = 'block';
-  } else {
-    if (q('#submitAllReviewedBtn')) q('#submitAllReviewedBtn').style.display = 'none';
+  // Auto-activate the first OK card from THIS batch only if the user isn't
+  // already reviewing a card. Don't yank focus away from a card mid-edit.
+  if (activeCardIndex === -1 && firstOkInBatch.length > 0) {
+    activateCard(firstOkInBatch[0]);
+  }
+
+  const anySuccessfulUnsubmitted = allUploadedFileResults.some(r => r.success && !r.submitted);
+  if (q('#submitAllReviewedBtn')) {
+    q('#submitAllReviewedBtn').style.display = anySuccessfulUnsubmitted ? 'block' : 'none';
   }
 }
 
@@ -520,7 +554,13 @@ function submitAllReviewedTickets() {
     .addMultipleTicketDataBatch(packagesToSubmit);
 }
 function activateCard(originalFileIndex) {
-  // ... (your existing function content)
+  // Bump the generation token so any in-flight async work from a prior
+  // activation (rAF iframe-swap, post-submit auto-advance) bails out instead
+  // of overwriting the now-current card. Blank the iframe synchronously so we
+  // never show OLD pdf + NEW form together.
+  const myGen = ++activationGeneration;
+  pdfPane.src = 'about:blank';
+
   if (activeCardIndex !== -1 && activeCardIndex !== originalFileIndex && formPaneContainer.querySelector('form')) {
     updateModifiedViolationDataFromForm(activePdfCurrentViolationDisplayIndex);
     const previousResultData = allUploadedFileResults.find(r => r.originalIndex === activeCardIndex);
@@ -540,11 +580,10 @@ function activateCard(originalFileIndex) {
   if (activeCardIndex === originalFileIndex && activeCardElement && !activeCardElement.classList.contains('state-submitted') && !activeCardElement.classList.contains('state-error')) {
       return;
   }
-  
+
   const resultData = allUploadedFileResults.find(r => r.originalIndex === originalFileIndex);
   if (!resultData) {
       console.warn("Cannot activate card: No result data found for index", originalFileIndex);
-      pdfPane.src = 'about:blank';
       formPaneContainer.innerHTML = '';
       formPaneContainer.appendChild(formPanePlaceholder);
       if (activeCardElement) activeCardElement.classList.remove('active-card');
@@ -555,7 +594,6 @@ function activateCard(originalFileIndex) {
 
   if (!resultData.success && !resultData.submitted) {
       console.warn("Cannot activate card: Analysis failed for index", originalFileIndex, resultData.message);
-      pdfPane.src = 'about:blank';
       formPaneContainer.innerHTML = `<div style="padding:20px; text-align:center; color:#ef4444;">Error processing this PDF: ${resultData.message || 'Unknown analysis error.'}</div>`;
       if (activeCardElement) activeCardElement.classList.remove('active-card');
       activeCardElement = q(`#card-${originalFileIndex}`);
@@ -563,15 +601,19 @@ function activateCard(originalFileIndex) {
       activeCardIndex = originalFileIndex;
       return;
   }
-  
+
   if (resultData.submitted) {
       console.log("Card already submitted, showing read-only info for index:", originalFileIndex);
-      pdfPane.src = resultData.fileUrl ? resultData.fileUrl.replace('/view?usp=sharing', '/preview').replace('/view', '/preview') : 'about:blank';
+      const submittedPreviewUrl = resultData.fileUrl ? resultData.fileUrl.replace('/view?usp=sharing', '/preview').replace('/view', '/preview') : 'about:blank';
       formPaneContainer.innerHTML = `<div style="padding:20px; text-align:center; color:#16a34a; font-weight:bold;"><i class="fas fa-check-circle"></i> This ticket has already been submitted.</div>`;
       if (activeCardElement) activeCardElement.classList.remove('active-card');
       activeCardElement = q(`#card-${originalFileIndex}`);
       if (activeCardElement) activeCardElement.classList.add('active-card');
       activeCardIndex = originalFileIndex;
+      requestAnimationFrame(() => {
+        if (myGen !== activationGeneration) return;
+        pdfPane.src = submittedPreviewUrl;
+      });
       return;
   }
 
@@ -587,8 +629,15 @@ function activateCard(originalFileIndex) {
   activePdfModifiedViolationsData = JSON.parse(JSON.stringify(resultData.modifiedOcrData.violations || []));
   resultData.reviewedSinceLoad = true;
 
-  pdfPane.src = activePdfFileUrl ? activePdfFileUrl.replace('/view?usp=sharing', '/preview').replace('/view', '/preview') : 'about:blank';
   buildFormForActivePdf();
+  // Set the new iframe src in a rAF after the form is built. If the user
+  // re-activates a different card before this fires, myGen will be stale and
+  // we leave the iframe blank for the next activation to handle.
+  const newPreviewUrl = activePdfFileUrl ? activePdfFileUrl.replace('/view?usp=sharing', '/preview').replace('/view', '/preview') : 'about:blank';
+  requestAnimationFrame(() => {
+    if (myGen !== activationGeneration) return;
+    pdfPane.src = newPreviewUrl;
+  });
 }
 
 function buildFormForActivePdf() {
@@ -772,15 +821,22 @@ function submitActiveTicketData() {
         activeResult.modifiedOcrData.isLateNotice = (dataPackage.isLateNotice);
       }
 
-      updateCardStatus(activeCardIndex, 'state-submitted', 'Submitted to Sheet');
-      if (activeCardElement) activeCardElement.onclick = () => activateCard(activeCardIndex);
+      const submittedIdx = activeCardIndex;
+      updateCardStatus(submittedIdx, 'state-submitted', 'Submitted to Sheet');
+      if (activeCardElement) activeCardElement.onclick = () => activateCard(submittedIdx);
 
       const nextUnsubmittedIndex = allUploadedFileResults.findIndex(r => r.success && !r.submitted);
       if (nextUnsubmittedIndex !== -1) {
-          setTimeout(() => activateCard(allUploadedFileResults[nextUnsubmittedIndex].originalIndex), 1500);
+          // Only auto-advance if the user is still on the just-submitted card.
+          // If they navigated away in the meantime, respect their choice.
+          setTimeout(() => {
+            if (activeCardIndex !== submittedIdx) return;
+            activateCard(allUploadedFileResults[nextUnsubmittedIndex].originalIndex);
+          }, 1500);
       } else {
           if(q('#submitAllReviewedBtn')) q('#submitAllReviewedBtn').style.display = 'none';
           setTimeout(() => {
+              if (activeCardIndex !== submittedIdx) return;
               formPaneContainer.innerHTML = ''; formPaneContainer.appendChild(formPanePlaceholder); pdfPane.src='about:blank';
               if(activeCardElement) activeCardElement.classList.remove('active-card');
               activeCardIndex = -1; activeCardElement = null;
