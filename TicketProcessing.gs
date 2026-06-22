@@ -806,6 +806,57 @@ function uploadAndAnalyzeTicketsBatch(filesData) {
   setBatchLoggingEnabled(false); // Disable batch logging (this will also flush any remaining logs)
   return summary;
 }
+
+/**
+ * Overwrites an already-uploaded ticket PDF in Drive with a rotated version.
+ * The rotation itself is performed client-side (pdf-lib in BatchTicketForm.html);
+ * this server endpoint just replaces the file's binary content IN PLACE so the
+ * fileId, sharing, and the URL already written to / about to be written to the
+ * sheet all stay valid. Used to correct upside-down scans before they're filed.
+ *
+ * @param {string} fileId      Drive File ID of the previously uploaded ticket PDF.
+ * @param {string} base64Data  Base64-encoded bytes of the rotated PDF.
+ * @returns {object} { success: true, fileId: string }
+ */
+function saveRotatedTicketPdf(fileId, base64Data) {
+  const functionName = "saveRotatedTicketPdf";
+  logToSheet_(functionName, `Saving rotated PDF for file ID: ${fileId}`, "INFO");
+
+  if (!fileId || !base64Data) {
+    throw new Error("saveRotatedTicketPdf requires both a fileId and base64 PDF data.");
+  }
+
+  try {
+    const bytes = Utilities.base64Decode(base64Data);
+
+    // Replace the file content in place via the Drive media-upload REST endpoint.
+    // DriveApp has no API to swap a file's binary content, so we PATCH the bytes
+    // directly using the script's own OAuth token (drive + external_request
+    // scopes are already granted in appsscript.json). This keeps the same fileId.
+    const token = ScriptApp.getOAuthToken();
+    const url = `https://www.googleapis.com/upload/drive/v3/files/${encodeURIComponent(fileId)}` +
+                `?uploadType=media&supportsAllDrives=true`;
+    const response = UrlFetchApp.fetch(url, {
+      method: "patch",
+      contentType: "application/pdf",
+      payload: bytes,
+      headers: { Authorization: "Bearer " + token },
+      muteHttpExceptions: true
+    });
+
+    const code = response.getResponseCode();
+    if (code < 200 || code >= 300) {
+      throw new Error(`Drive content update failed (HTTP ${code}): ${response.getContentText()}`);
+    }
+
+    logToSheet_(functionName, `Rotated PDF saved in place for file ID: ${fileId}.`, "SUCCESS");
+    return { success: true, fileId: fileId };
+  } catch (e) {
+    logToSheet_(functionName, `Error saving rotated PDF for ${fileId}: ${e.toString()}` +
+      (e.stack ? ` Stack: ${e.stack}` : ""), "ERROR");
+    throw new Error(`Failed to save rotated PDF: ${e.message}`);
+  }
+}
 // ====================================================================
 // Gemini API Interaction
 // ====================================================================
