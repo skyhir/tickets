@@ -3,11 +3,21 @@
 <head>
   <base target="_top" />
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+  <!-- pdf-lib: client-side PDF rotation for correcting upside-down scans before filing. -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js"></script>
   <style>
     body { font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif; margin: 0; padding: 0; display: flex; height: 100vh; background-color: #f0f2f5; }
     #queue { width: 300px; min-width:250px; max-width:400px; height: 100vh; border-right: 1px solid #d1d5db; background-color: #f9fafb; overflow-y: auto; padding: 10px; display: flex; flex-direction: column; box-sizing: border-box; }
     #viewer { flex: 1; display: flex; flex-direction: column; background-color: #ffffff; }
     #pdfPane { flex: 1; border: none; min-height: 300px; } /* Ensure PDF pane is visible */
+
+    /* PDF orientation toolbar (rotate upside-down scans before filing) */
+    #pdfToolbar { display: none; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid #d1d5db; background-color: #f9fafb; font-size: 0.8rem; color: #6b7280; flex-wrap: wrap; }
+    #pdfToolbar .rotate-label { margin-right: 4px; }
+    #pdfToolbar button { padding: 6px 10px; background-color: #6b7280; color: #fff; border: none; border-radius: 4px; font-size: 0.8rem; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; }
+    #pdfToolbar button:hover { background-color: #4b5563; }
+    #pdfToolbar button:disabled { background-color: #d1d5db; cursor: not-allowed; }
+    #rotateStatus { margin-left: auto; font-weight: 600; }
     #formPaneContainer { height: 45%; /* Adjust as needed */ overflow-y: auto; padding: 15px; border-top: 1px solid #d1d5db; background-color: #f9fafb; box-sizing: border-box;}
 
     #fileInput { display: block; width: calc(100% - 16px); padding: 8px; margin: 0 auto 10px auto; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
@@ -86,6 +96,12 @@
 <div id="batchSubmitStatus" style="text-align: center; font-size: 0.85rem; margin-top: 5px;"></div>
   </div>
   <div id="viewer">
+    <div id="pdfToolbar">
+      <span class="rotate-label"><i class="fas fa-sync-alt"></i> Scan sideways / upside down?</span>
+      <button type="button" id="rotateLeftBtn" title="Rotate 90&deg; counter-clockwise"><i class="fas fa-undo"></i> Rotate Left</button>
+      <button type="button" id="rotateRightBtn" title="Rotate 90&deg; clockwise"><i class="fas fa-redo"></i> Rotate Right</button>
+      <span id="rotateStatus"></span>
+    </div>
     <iframe id="pdfPane" title="PDF Preview"></iframe>
     <div id="formPaneContainer">
         <div id="formPanePlaceholder" style="text-align:center; color:#6b7280; padding-top:50px;">
@@ -180,6 +196,13 @@ let activePdfIsLateNotice = false;
 let activePdfFileUrl = '';
 let activePdfFileId = '';
 let activeCardElement = null;
+// originalIndex -> base64 of the originally-uploaded PDF bytes. Captured at
+// upload time so the rotate feature can re-encode locally without re-fetching
+// from Drive. Consumed (moved onto each cardData) in appendBatchResults.
+const pdfBytesByIndex = {};
+// Object URL of the locally-rendered (rotated) PDF currently in the iframe, if
+// any. Tracked so we can revoke it when switching cards / re-rotating.
+let activePdfBlobUrl = null;
 // Monotonic id for cards. New batches dropped during an in-flight batch get
 // fresh ids so they never collide with cards from prior batches.
 let nextOriginalIndex = 0;
@@ -224,6 +247,12 @@ window.onload = function() {
   } else {
     console.error("submitAllReviewedBtn not found!");
   }
+
+  // Rotate controls (correct sideways / upside-down scans before filing).
+  const rotateLeftBtn = q('#rotateLeftBtn');
+  const rotateRightBtn = q('#rotateRightBtn');
+  if (rotateLeftBtn) rotateLeftBtn.onclick = () => rotateActivePdf(-90);
+  if (rotateRightBtn) rotateRightBtn.onclick = () => rotateActivePdf(90);
 
   // --- Direct Drag-and-Drop Event Listener Attachment ---
   console.log("Attaching D&D listeners directly...");
@@ -355,6 +384,10 @@ function uploadAndProcessBatch(files) {
     // res.index back to the right card without colliding with concurrent batches.
     const validOriginalIndicesByPos = validFilesToProcess.map(fd => fd.originalIndex);
 
+    // Stash the uploaded PDF bytes so the rotate feature can re-encode locally
+    // without a round-trip to Drive. Picked up in appendBatchResults.
+    validFilesToProcess.forEach(fd => { pdfBytesByIndex[fd.originalIndex] = fd.data; });
+
     google.script.run
       .withSuccessHandler(summary => appendBatchResults(validOriginalIndicesByPos, summary))
       .withFailureHandler(err => {
@@ -425,8 +458,14 @@ function appendBatchResults(batchOriginalIndices, summary) {
       ocrData: res.ocrData || { isLateNotice: false, violations: [] },
       message: res.message,
       submitted: false,
-      reviewedSinceLoad: false
+      reviewedSinceLoad: false,
+      // Current PDF bytes (base64) for this card. Mutated in place when rotated.
+      pdfBase64: pdfBytesByIndex[originalIndex] || null,
+      // True once the user has rotated this scan (so re-activating shows the
+      // corrected orientation locally instead of Drive's cached preview).
+      rotated: false
     };
+    delete pdfBytesByIndex[originalIndex]; // moved onto cardData; free the map entry
     cardData.modifiedOcrData = JSON.parse(JSON.stringify(cardData.ocrData));
 
     // If a card with this index already exists in state (shouldn't normally,
@@ -560,6 +599,10 @@ function activateCard(originalFileIndex) {
   // never show OLD pdf + NEW form together.
   const myGen = ++activationGeneration;
   pdfPane.src = 'about:blank';
+  // Tear down any locally-rendered (rotated) preview from the prior card and
+  // hide the rotate toolbar; the reviewable branch below re-enables it.
+  if (activePdfBlobUrl) { URL.revokeObjectURL(activePdfBlobUrl); activePdfBlobUrl = null; }
+  setRotateToolbarVisible(false);
 
   if (activeCardIndex !== -1 && activeCardIndex !== originalFileIndex && formPaneContainer.querySelector('form')) {
     updateModifiedViolationDataFromForm(activePdfCurrentViolationDisplayIndex);
@@ -630,13 +673,22 @@ function activateCard(originalFileIndex) {
   resultData.reviewedSinceLoad = true;
 
   buildFormForActivePdf();
+  // This card can be rotated — surface the toolbar.
+  setRotateToolbarVisible(true);
   // Set the new iframe src in a rAF after the form is built. If the user
   // re-activates a different card before this fires, myGen will be stale and
   // we leave the iframe blank for the next activation to handle.
   const newPreviewUrl = activePdfFileUrl ? activePdfFileUrl.replace('/view?usp=sharing', '/preview').replace('/view', '/preview') : 'about:blank';
   requestAnimationFrame(() => {
     if (myGen !== activationGeneration) return;
-    pdfPane.src = newPreviewUrl;
+    // If the user already rotated this scan, render the corrected bytes locally
+    // (Drive's cached /preview can lag the in-place content update). Otherwise
+    // show the normal Drive preview.
+    if (resultData.rotated && resultData.pdfBase64) {
+      showLocalPdfPreview(base64ToUint8Array(resultData.pdfBase64), myGen);
+    } else {
+      pdfPane.src = newPreviewUrl;
+    }
   });
 }
 
@@ -856,6 +908,125 @@ function submitActiveTicketData() {
       submitBtn.innerHTML = '<i class="fas fa-exclamation-triangle"></i> Retry Submission';
     })
     .addMultipleTicketData(dataPackage);
+}
+
+// ====================================================================
+// PDF rotation — fix sideways / upside-down scans before they're filed.
+// Rotation runs client-side via pdf-lib; the corrected bytes are saved back
+// over the SAME Drive file (same fileId/URL) by saveRotatedTicketPdf.
+// ====================================================================
+
+function setRotateToolbarVisible(visible) {
+  const tb = q('#pdfToolbar');
+  if (tb) tb.style.display = visible ? 'flex' : 'none';
+  if (visible) setRotateStatus('');
+}
+
+function setRotateStatus(text, color) {
+  const el = q('#rotateStatus');
+  if (!el) return;
+  el.textContent = text || '';
+  el.style.color = color || '#6b7280';
+}
+
+function setRotateButtonsDisabled(disabled) {
+  ['#rotateLeftBtn', '#rotateRightBtn'].forEach(sel => {
+    const b = q(sel);
+    if (b) b.disabled = disabled;
+  });
+}
+
+function base64ToUint8Array(b64) {
+  const binary = atob(b64);
+  const len = binary.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+function uint8ArrayToBase64(bytes) {
+  let binary = '';
+  const chunkSize = 0x8000; // avoid call-stack limits on String.fromCharCode
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+// Render PDF bytes locally in the preview iframe via a blob URL so the user
+// sees the corrected orientation immediately (Drive's /preview is cached and
+// can lag the in-place content update).
+function showLocalPdfPreview(bytes, myGen) {
+  try {
+    if (activePdfBlobUrl) { URL.revokeObjectURL(activePdfBlobUrl); activePdfBlobUrl = null; }
+    const blob = new Blob([bytes], { type: 'application/pdf' });
+    const url = URL.createObjectURL(blob);
+    activePdfBlobUrl = url;
+    if (myGen === undefined || myGen === activationGeneration) {
+      pdfPane.src = url;
+    }
+  } catch (e) {
+    console.error('Local PDF preview error:', e);
+  }
+}
+
+// Rotate every page of the active PDF by deltaDegrees (-90 = CCW, +90 = CW),
+// update the preview, and persist the rotated bytes back to Drive in place.
+async function rotateActivePdf(deltaDegrees) {
+  if (activeCardIndex === -1) return;
+  const resultData = allUploadedFileResults.find(r => r.originalIndex === activeCardIndex);
+  if (!resultData || resultData.submitted || !resultData.success) return;
+
+  if (!resultData.pdfBase64) {
+    setRotateStatus('Original PDF not available to rotate.', '#ef4444');
+    return;
+  }
+  if (typeof PDFLib === 'undefined') {
+    setRotateStatus('PDF tools still loading — try again in a moment.', '#ef4444');
+    return;
+  }
+
+  const myGen = activationGeneration; // bail out of preview/save if user switches cards
+  setRotateButtonsDisabled(true);
+  setRotateStatus('Rotating…', '#3b82f6');
+
+  try {
+    const srcBytes = base64ToUint8Array(resultData.pdfBase64);
+    const pdfDoc = await PDFLib.PDFDocument.load(srcBytes);
+    pdfDoc.getPages().forEach(page => {
+      const current = (page.getRotation() && page.getRotation().angle) || 0;
+      const next = (((current + deltaDegrees) % 360) + 360) % 360;
+      page.setRotation(PDFLib.degrees(next));
+    });
+    const rotatedBytes = await pdfDoc.save();
+    const rotatedB64 = uint8ArrayToBase64(rotatedBytes);
+
+    // Persist locally so further rotations stack and re-activation re-renders it.
+    resultData.pdfBase64 = rotatedB64;
+    resultData.rotated = true;
+
+    if (myGen === activationGeneration) showLocalPdfPreview(rotatedBytes, myGen);
+
+    setRotateStatus('Saving to Drive…', '#3b82f6');
+    google.script.run
+      .withSuccessHandler(() => {
+        setRotateButtonsDisabled(false);
+        // Only report success if the user is still on this card.
+        if (myGen === activationGeneration) setRotateStatus('Rotation saved to Drive ✓', '#16a34a');
+      })
+      .withFailureHandler(err => {
+        setRotateButtonsDisabled(false);
+        console.error('saveRotatedTicketPdf failed:', err);
+        if (myGen === activationGeneration) {
+          setRotateStatus('Rotated, but Drive save failed: ' + err.message, '#ef4444');
+        }
+      })
+      .saveRotatedTicketPdf(resultData.fileId, rotatedB64);
+  } catch (e) {
+    console.error('Rotation error:', e);
+    setRotateButtonsDisabled(false);
+    setRotateStatus('Rotation failed: ' + e.message, '#ef4444');
+  }
 }
 </script>
 </body>
