@@ -40,7 +40,7 @@ function emailDriversTicketNotifications() {
       logToSheet_(functionName, `Failed to fetch logo blob: ${e}`, "WARN");
   }
   const pic = enLogoBlob ? "<a href='http://www.envoythere.com'><img src='cid:enLogo' style='width:100px; height:75px;' alt='Envoy Logo'/></a>" : "";
-  const bcc = "sky@envoythere.com";
+  const bcc = "sky@envoythere.com, jaesa@envoythere.com";
   const adminFee = 25.00;
   // --- End Email Configuration ---
 
