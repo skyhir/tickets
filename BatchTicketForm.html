@@ -5,11 +5,25 @@
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
   <!-- pdf-lib: client-side PDF rotation for correcting upside-down scans before filing. -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js"></script>
+  <!-- pdf.js: renders the rotated preview to a <canvas>. The Apps Script dialog
+       sandbox blocks blob:/data: PDFs in an <iframe>, so we can't preview rotated
+       bytes through the Drive iframe; canvas rendering works inside the sandbox. -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
+  <script>
+    if (window.pdfjsLib) {
+      pdfjsLib.GlobalWorkerOptions.workerSrc =
+        'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
+    }
+  </script>
   <style>
     body { font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif; margin: 0; padding: 0; display: flex; height: 100vh; background-color: #f0f2f5; }
     #queue { width: 300px; min-width:250px; max-width:400px; height: 100vh; border-right: 1px solid #d1d5db; background-color: #f9fafb; overflow-y: auto; padding: 10px; display: flex; flex-direction: column; box-sizing: border-box; }
     #viewer { flex: 1; display: flex; flex-direction: column; background-color: #ffffff; }
     #pdfPane { flex: 1; border: none; min-height: 300px; } /* Ensure PDF pane is visible */
+    /* Local (rotated) preview rendered via pdf.js canvases. Shares the iframe's
+       flex slot; only one of #pdfPane / #pdfCanvasWrap is visible at a time. */
+    #pdfCanvasWrap { display: none; flex: 1; min-height: 300px; overflow: auto; background-color: #525659; text-align: center; padding: 12px 0; box-sizing: border-box; }
+    #pdfCanvasWrap canvas { max-width: 100%; margin: 0 auto 12px auto; box-shadow: 0 1px 4px rgba(0,0,0,0.4); background: #fff; display: block; }
 
     /* PDF orientation toolbar (rotate upside-down scans before filing) */
     #pdfToolbar { display: none; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid #d1d5db; background-color: #f9fafb; font-size: 0.8rem; color: #6b7280; flex-wrap: wrap; }
@@ -103,6 +117,7 @@
       <span id="rotateStatus"></span>
     </div>
     <iframe id="pdfPane" title="PDF Preview"></iframe>
+    <div id="pdfCanvasWrap" title="Rotated PDF Preview"></div>
     <div id="formPaneContainer">
         <div id="formPanePlaceholder" style="text-align:center; color:#6b7280; padding-top:50px;">
             <i class="fas fa-file-alt fa-3x" style="margin-bottom:15px;"></i><br>
@@ -200,9 +215,6 @@ let activeCardElement = null;
 // upload time so the rotate feature can re-encode locally without re-fetching
 // from Drive. Consumed (moved onto each cardData) in appendBatchResults.
 const pdfBytesByIndex = {};
-// Object URL of the locally-rendered (rotated) PDF currently in the iframe, if
-// any. Tracked so we can revoke it when switching cards / re-rotating.
-let activePdfBlobUrl = null;
 // Monotonic id for cards. New batches dropped during an in-flight batch get
 // fresh ids so they never collide with cards from prior batches.
 let nextOriginalIndex = 0;
@@ -598,10 +610,10 @@ function activateCard(originalFileIndex) {
   // of overwriting the now-current card. Blank the iframe synchronously so we
   // never show OLD pdf + NEW form together.
   const myGen = ++activationGeneration;
-  pdfPane.src = 'about:blank';
-  // Tear down any locally-rendered (rotated) preview from the prior card and
-  // hide the rotate toolbar; the reviewable branch below re-enables it.
-  if (activePdfBlobUrl) { URL.revokeObjectURL(activePdfBlobUrl); activePdfBlobUrl = null; }
+  // Blank both preview surfaces (Drive iframe + rotated canvas) synchronously so
+  // we never show OLD pdf + NEW form together; the branches below pick which to
+  // show. Also hide the rotate toolbar; the reviewable branch re-enables it.
+  showDrivePreview('about:blank');
   setRotateToolbarVisible(false);
 
   if (activeCardIndex !== -1 && activeCardIndex !== originalFileIndex && formPaneContainer.querySelector('form')) {
@@ -655,7 +667,7 @@ function activateCard(originalFileIndex) {
       activeCardIndex = originalFileIndex;
       requestAnimationFrame(() => {
         if (myGen !== activationGeneration) return;
-        pdfPane.src = submittedPreviewUrl;
+        showDrivePreview(submittedPreviewUrl);
       });
       return;
   }
@@ -682,12 +694,13 @@ function activateCard(originalFileIndex) {
   requestAnimationFrame(() => {
     if (myGen !== activationGeneration) return;
     // If the user already rotated this scan, render the corrected bytes locally
-    // (Drive's cached /preview can lag the in-place content update). Otherwise
-    // show the normal Drive preview.
+    // via pdf.js (Drive's cached /preview can lag the in-place content update,
+    // and the sandbox can't show blob PDFs in the iframe). Otherwise show the
+    // normal Drive preview.
     if (resultData.rotated && resultData.pdfBase64) {
-      showLocalPdfPreview(base64ToUint8Array(resultData.pdfBase64), myGen);
+      showCanvasPreview(resultData.pdfBase64, myGen);
     } else {
-      pdfPane.src = newPreviewUrl;
+      showDrivePreview(newPreviewUrl);
     }
   });
 }
@@ -953,20 +966,53 @@ function uint8ArrayToBase64(bytes) {
   return btoa(binary);
 }
 
-// Render PDF bytes locally in the preview iframe via a blob URL so the user
-// sees the corrected orientation immediately (Drive's /preview is cached and
-// can lag the in-place content update).
-function showLocalPdfPreview(bytes, myGen) {
+// Show the normal Drive-hosted preview in the iframe; hide/clear the canvas.
+function showDrivePreview(url) {
+  const wrap = q('#pdfCanvasWrap');
+  if (wrap) { wrap.style.display = 'none'; wrap.innerHTML = ''; }
+  if (pdfPane) { pdfPane.style.display = ''; pdfPane.src = url || 'about:blank'; }
+}
+
+// Render rotated PDF bytes (base64) locally with pdf.js into stacked canvases.
+// The Apps Script dialog sandbox refuses to display blob:/data: PDFs in an
+// <iframe>, so canvas rendering is the only way to preview rotated bytes before
+// they're re-fetched from Drive. pdf.js honors each page's /Rotate, so the
+// pdf-lib rotation shows through automatically.
+async function showCanvasPreview(base64, myGen) {
+  const wrap = q('#pdfCanvasWrap');
+  if (!wrap) return;
+  if (pdfPane) { pdfPane.src = 'about:blank'; pdfPane.style.display = 'none'; }
+  wrap.style.display = 'block';
+  wrap.innerHTML = '<div style="color:#cbd5e1; padding:20px; font-size:0.85rem;">Rendering rotated preview…</div>';
+
+  if (typeof pdfjsLib === 'undefined') {
+    wrap.innerHTML = '<div style="color:#fca5a5; padding:20px; font-size:0.85rem;">Preview renderer is still loading — the rotation was still saved to Drive.</div>';
+    return;
+  }
+
   try {
-    if (activePdfBlobUrl) { URL.revokeObjectURL(activePdfBlobUrl); activePdfBlobUrl = null; }
-    const blob = new Blob([bytes], { type: 'application/pdf' });
-    const url = URL.createObjectURL(blob);
-    activePdfBlobUrl = url;
-    if (myGen === undefined || myGen === activationGeneration) {
-      pdfPane.src = url;
+    const bytes = base64ToUint8Array(base64);
+    const pdf = await pdfjsLib.getDocument({ data: bytes }).promise;
+    if (myGen !== undefined && myGen !== activationGeneration) { if (pdf.destroy) pdf.destroy(); return; }
+
+    wrap.innerHTML = '';
+    const targetWidth = Math.max(200, wrap.clientWidth - 24);
+    for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+      if (myGen !== undefined && myGen !== activationGeneration) break;
+      const page = await pdf.getPage(pageNum);
+      const unscaled = page.getViewport({ scale: 1 });
+      const viewport = page.getViewport({ scale: targetWidth / unscaled.width });
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.floor(viewport.width);
+      canvas.height = Math.floor(viewport.height);
+      if (myGen !== undefined && myGen !== activationGeneration) break;
+      wrap.appendChild(canvas);
+      await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
     }
   } catch (e) {
-    console.error('Local PDF preview error:', e);
+    console.error('Canvas preview error:', e);
+    wrap.innerHTML = '<div style="color:#fca5a5; padding:20px; font-size:0.85rem;">Could not render preview (' +
+      (e && e.message ? e.message : e) + '). The rotation was still saved to Drive.</div>';
   }
 }
 
@@ -1005,7 +1051,7 @@ async function rotateActivePdf(deltaDegrees) {
     resultData.pdfBase64 = rotatedB64;
     resultData.rotated = true;
 
-    if (myGen === activationGeneration) showLocalPdfPreview(rotatedBytes, myGen);
+    if (myGen === activationGeneration) showCanvasPreview(rotatedB64, myGen);
 
     setRotateStatus('Saving to Drive…', '#3b82f6');
     google.script.run
