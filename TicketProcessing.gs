@@ -1716,7 +1716,14 @@ function parseFlexibleDate_(dateString) {
  */
 function parseFlexibleTime_(timeString, contextDate = null) {
     if (!timeString || typeof timeString !== 'string') return null;
-    timeString = timeString.trim().toUpperCase(); // Normalize case for AM/PM
+    // Normalize: uppercase for AM/PM, collapse non-breaking/duplicate spaces (Sheets
+    // display values often carry U+00A0), and strip periods in "A.M."/"P.M.".
+    timeString = timeString
+        .replace(/[   ]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toUpperCase()
+        .replace(/([AP])\.\s?M\.?$/, '$1M');
     let parsedTime = null;
     const functionName = "parseFlexibleTime_";
 
@@ -1724,9 +1731,21 @@ function parseFlexibleTime_(timeString, contextDate = null) {
         let hours = 0, minutes = 0, seconds = 0;
         let match;
 
-        // Try HH:MM:SS (24hr)
-        match = timeString.match(/^(\d{1,2}):(\d{2}):(\d{2})$/);
+        // Try h:mm[:ss][ ]AM/PM (12hr) — check first so "1:28:59 PM" isn't mistaken
+        // for a bare 24hr value. Seconds are optional.
+        match = timeString.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?\s*([AP]M)$/);
         if (match) {
+            hours = parseInt(match[1]);
+            minutes = parseInt(match[2]);
+            seconds = match[3] ? parseInt(match[3]) : 0;
+            const ampm = match[4];
+
+            if (ampm === "PM" && hours < 12) hours += 12;
+            if (ampm === "AM" && hours === 12) hours = 0; // Midnight case
+            parsedTime = new Date(1970, 0, 1, hours, minutes, seconds);
+        }
+        // Try HH:MM:SS (24hr)
+        else if ((match = timeString.match(/^(\d{1,2}):(\d{2}):(\d{2})$/))) {
             hours = parseInt(match[1]);
             minutes = parseInt(match[2]);
             seconds = parseInt(match[3]);
@@ -1738,17 +1757,21 @@ function parseFlexibleTime_(timeString, contextDate = null) {
             minutes = parseInt(match[2]);
             parsedTime = new Date(1970, 0, 1, hours, minutes, 0);
         }
-        // Try h:mm[ ]AM/PM or hh:mm[ ]AM/PM
-        else if ((match = timeString.match(/^(\d{1,2}):(\d{2})\s*([AP]M)$/))) {
+        // Try h[ ]AM/PM with no minutes (e.g. "9 PM", "12AM")
+        else if ((match = timeString.match(/^(\d{1,2})\s*([AP]M)$/))) {
             hours = parseInt(match[1]);
-            minutes = parseInt(match[2]);
-            const ampm = match[3];
-
+            const ampm = match[2];
             if (ampm === "PM" && hours < 12) hours += 12;
-            if (ampm === "AM" && hours === 12) hours = 0; // Midnight case
-            parsedTime = new Date(1970, 0, 1, hours, minutes, 0);
+            if (ampm === "AM" && hours === 12) hours = 0;
+            parsedTime = new Date(1970, 0, 1, hours, 0, 0);
         }
          // Add more formats here if needed
+
+        // Reject out-of-range components (JS Date silently rolls "25:00" over).
+        if (parsedTime && (hours > 23 || minutes > 59 || seconds > 59)) {
+            logToSheet_(functionName, `Time string "${timeString}" has out-of-range components.`, "WARN");
+            parsedTime = null;
+        }
 
         if (parsedTime && !isNaN(parsedTime)) {
             logToSheet_(functionName, `Successfully parsed time string "${timeString}" to Date object.`, "DEBUG");

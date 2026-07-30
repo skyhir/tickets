@@ -59,11 +59,14 @@ function manualBookingLookupForRow() {
   const parsedDate = parseFlexibleDate_(dateStr);
   const parsedTime = parseFlexibleTime_(timeStr, parsedDate);
   if (!parsedDate || !parsedTime) {
+    const bad = [];
+    if (!parsedDate) bad.push(`date col D = "${dateStr}"`);
+    if (!parsedTime) bad.push(`time col F = "${timeStr}"`);
     ui.alert(
       "Unparsable date/time",
-      `Row ${row}: could not read a valid violation date AND time ` +
-      `(date col D = "${dateStr}", time col F = "${timeStr}"). ` +
-      `Booking attribution is time-of-day specific, so both are required. Fix them and retry.`,
+      `Row ${row}: could not read ${bad.join(" and ")}.\n\n` +
+      `Expected date as MM/DD/YYYY or YYYY-MM-DD, and time as h:mm[:ss] AM/PM or HH:mm[:ss]. ` +
+      `Booking attribution is time-of-day specific, so both are required. Fix and retry.`,
       ui.ButtonSet.OK
     );
     return;
