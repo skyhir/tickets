@@ -77,9 +77,17 @@ const COL = {
   // Z: Dispute Status (Accounting)
   PAYMENT_STATUS: 27,         // AA: Payment Status (Sky)
   NOTES: 28,                  // AB: Notes
-  PDF_LINK: 29                // AC: PDF
+  PDF_LINK: 29,               // AC: PDF
+  PAID_TIMESTAMP: 30          // AD: Date/Time Driver Paid (stamped by processTicketPayments on a successful charge)
 };
-// IMPORTANT: Ensure your TARGET_SHEET_NAME actually has columns up to AC (29)
+// Header text used to locate COL.PAID_TIMESTAMP by name, so the stamp still lands
+// correctly if the column is inserted at a different position on a tab.
+const PAID_TIMESTAMP_HEADER = "Date/Time Driver Paid";
+const PAID_TIMESTAMP_FORMAT = "M/d/yyyy h:mm:ss AM/PM";
+
+// IMPORTANT: Ensure your TARGET_SHEET_NAME actually has columns up to AC (29).
+// Deliberately still 29: new rows appended by the upload write A:AC and leave AD
+// (Date/Time Driver Paid) untouched, since only a successful charge may fill it.
 const NUM_COLUMNS = 29; // Updated to include up to column AC
 // In TicketProcessingv2-NeedsDebugging.gs.txt
 
