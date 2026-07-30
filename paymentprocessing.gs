@@ -22,8 +22,48 @@ function toUrlEncoded_(obj) {
     return params.join('&');
 }
 /**
+ * Resolves the "Date/Time Driver Paid" column (AD) for a given sheet.
+ *
+ * Prefers a header-text match on row 1 so the stamp follows the column if it is
+ * ever moved or inserted at a different index on one of the tabs; falls back to
+ * the declared COL.PAID_TIMESTAMP index. Returns null (and logs) when the sheet
+ * has no such column, so callers can skip stamping instead of writing to the
+ * wrong cell.
+ *
+ * @param {Sheet} sheet The violations tab.
+ * @returns {number|null} 1-based column index, or null if unavailable.
+ */
+function resolvePaidTimestampCol_(sheet) {
+  const functionName = "resolvePaidTimestampCol_";
+  const maxCols = sheet.getMaxColumns();
+
+  try {
+    const lastCol = sheet.getLastColumn();
+    if (lastCol > 0) {
+      const headers = sheet.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
+      const wanted = PAID_TIMESTAMP_HEADER.replace(/\s+/g, ' ').trim().toLowerCase();
+      for (let c = 0; c < headers.length; c++) {
+        const h = (headers[c] || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
+        if (h === wanted) return c + 1;
+      }
+    }
+  } catch (e) {
+    logToSheet_(functionName, `Header scan failed on "${sheet.getName()}": ${e}. Falling back to index ${COL.PAID_TIMESTAMP}.`, "WARN");
+  }
+
+  if (COL.PAID_TIMESTAMP <= maxCols) {
+    logToSheet_(functionName, `No "${PAID_TIMESTAMP_HEADER}" header on "${sheet.getName()}"; falling back to column ${COL.PAID_TIMESTAMP}.`, "WARN");
+    return COL.PAID_TIMESTAMP;
+  }
+
+  logToSheet_(functionName, `"${sheet.getName()}" has no "${PAID_TIMESTAMP_HEADER}" column and only ${maxCols} columns. Paid timestamps will not be recorded for this tab.`, "WARN");
+  return null;
+}
+
+/**
  * Processes payments for tickets marked with 'Attempt' status in Column O (DRIVER_BILLING_STATUS).
  * **REVISED: Filters rows first for efficiency and reduced logging.**
+ * Successful charges stamp the time of the charge into "Date/Time Driver Paid" (AD).
  */
 function processTicketPayments() {
   const functionName = "processTicketPayments";
@@ -46,6 +86,16 @@ function processTicketPayments() {
   const bookingIdColIndex = COL.BOOKING_ID - 1;
   const originalPenaltyColIndex = COL.ORIGINAL_PENALTY - 1;
   const totalOwedCol = COL.TOTAL_OWED_COLLECTIONS; // Column AA
+
+  // "Date/Time Driver Paid" (AD) resolved once per tab, keyed by sheet name.
+  const paidTsColBySheet = {};
+  const paidTsColFor = function (sheet) {
+    const key = sheet.getName();
+    if (!(key in paidTsColBySheet)) {
+      paidTsColBySheet[key] = resolvePaidTimestampCol_(sheet);
+    }
+    return paidTsColBySheet[key];
+  };
 
   // --- Filter Attempt rows across every violations tab first ---
   // Each item carries its sheet so updates write back to the tab the row came from.
@@ -169,10 +219,28 @@ function processTicketPayments() {
       if (totalOwedCol && totalOwedCol > 0 && totalOwedCol <= sheet.getMaxColumns()) {
         sheet.getRange(actualRowNum, totalOwedCol).setValue(0).setNumberFormat("$#,##0.00");
       }
+      // Stamp when the charge actually cleared. Only successful Stripe charges get
+      // a timestamp — declines and $0 rows are left blank on purpose.
+      const paidTsCol = paidTsColFor(sheet);
+      if (paidTsCol) {
+        sheet.getRange(actualRowNum, paidTsCol)
+             .setValue(new Date())
+             .setNumberFormat(PAID_TIMESTAMP_FORMAT);
+      }
       successCount++;
     } else {
       logToSheet_(functionName, `"${sheet.getName()}" Row ${actualRowNum}: Payment failed. Reason: ${paymentResult.message}`, "WARN");
       sheet.getRange(actualRowNum, COL.DRIVER_BILLING_STATUS).setValue("Collections");
+      // Clear any stale paid timestamp: a row re-run as 'Attempt' after an earlier
+      // success must not keep claiming the driver paid when this charge declined.
+      const failedTsCol = paidTsColFor(sheet);
+      if (failedTsCol) {
+        const tsCell = sheet.getRange(actualRowNum, failedTsCol);
+        if ((tsCell.getDisplayValue() || '').trim()) {
+          logToSheet_(functionName, `"${sheet.getName()}" Row ${actualRowNum}: Clearing stale paid timestamp after declined charge.`, "WARN");
+          tsCell.clearContent();
+        }
+      }
        if (totalOwedCol && totalOwedCol > 0 && totalOwedCol <= sheet.getMaxColumns()) {
           sheet.getRange(actualRowNum, totalOwedCol).setValue(amountToCharge).setNumberFormat("$#,##0.00");
        } else {
