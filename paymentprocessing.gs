@@ -21,6 +21,136 @@ function toUrlEncoded_(obj) {
     }
     return params.join('&');
 }
+
+// Cascade limits for attemptStripeCharge_. A driver with a long wallet history can
+// have a dozen saved cards; walking all of them turns one unpaid citation into a
+// dozen declines on the same customer, which is what trips Stripe's card-testing
+// protection. Five is enough to clear a stale primary card without that risk.
+const MAX_CARD_ATTEMPTS = 5;
+
+// Declines where the issuer is telling us to stop, not to try harder. Continuing
+// down the wallet after one of these is what gets a customer flagged.
+const HARD_DECLINE_CODES = [
+  'stolen_card',
+  'lost_card',
+  'fraudulent',
+  'pickup_card',
+  'restricted_card',
+  'revocation_of_all_authorizations',
+  'merchant_blacklist'
+];
+
+/**
+ * Reads the customer's default payment method so the cascade starts with the card
+ * the driver actually expects to be charged.
+ *
+ * Stripe's /v1/payment_methods list is ordered by creation date, NOT by default, so
+ * without this the "first" card is simply the most recently added one. A failure here
+ * is non-fatal — we fall back to creation order.
+ *
+ * @param {string} stripeKey The Stripe Secret Key.
+ * @param {string} stripeCustomerId The Stripe Customer ID ('cus_...').
+ * @returns {string|null} The default payment method id, or null if unset/unavailable.
+ */
+function getDefaultPaymentMethodId_(stripeKey, stripeCustomerId) {
+  const functionName = "getDefaultPaymentMethodId_";
+  try {
+    const response = UrlFetchApp.fetch(`https://api.stripe.com/v1/customers/${encodeURIComponent(stripeCustomerId)}`, {
+      method: 'get',
+      headers: { Authorization: 'Bearer ' + stripeKey },
+      muteHttpExceptions: true
+    });
+    if (response.getResponseCode() !== 200) {
+      logToSheet_(functionName, `Could not read customer ${stripeCustomerId} (Code: ${response.getResponseCode()}). Falling back to creation order.`, "WARN");
+      return null;
+    }
+    const customer = JSON.parse(response.getContentText());
+    const defaultPmId = (customer.invoice_settings && customer.invoice_settings.default_payment_method) || null;
+    logToSheet_(functionName, defaultPmId
+      ? `Default payment method for ${stripeCustomerId}: ${defaultPmId}`
+      : `No default payment method set for ${stripeCustomerId}. Using creation order.`, "DEBUG");
+    return defaultPmId;
+  } catch (e) {
+    logToSheet_(functionName, `Error reading default payment method for ${stripeCustomerId}: ${e.message}. Falling back to creation order.`, "WARN");
+    return null;
+  }
+}
+
+/**
+ * Turns the raw Stripe payment-method list into the ordered list of cards worth charging.
+ *
+ * Order: default card first, then newest-first. Duplicates are collapsed on
+ * card.fingerprint — drivers routinely re-add the same physical card, and charging it
+ * three times only produces three identical declines. Cards already past their
+ * expiry are dropped, unless every card on file is expired, in which case the newest
+ * one is still attempted so the row lands in Collections with a real Stripe decline
+ * behind it rather than no record at all.
+ *
+ * @param {Array} pmData The `data` array from /v1/payment_methods.
+ * @param {string|null} defaultPmId The customer's default payment method id, if any.
+ * @param {string} callerName Function name to attribute log lines to.
+ * @returns {Array<{id: string, label: string, isDefault: boolean}>} Cards to attempt, in order.
+ */
+function selectChargeCandidates_(pmData, defaultPmId, callerName) {
+  const functionName = callerName || "selectChargeCandidates_";
+  const now = new Date();
+  const nowYear = now.getFullYear();
+  const nowMonth = now.getMonth() + 1; // 1-based, to match Stripe's exp_month
+
+  const describe = function (pm) {
+    const card = pm.card || {};
+    const brand = card.brand ? String(card.brand) : 'card';
+    const last4 = card.last4 ? `••${card.last4}` : pm.id;
+    const exp = (card.exp_month && card.exp_year) ? ` exp ${card.exp_month}/${card.exp_year}` : '';
+    return `${brand} ${last4}${exp}`;
+  };
+
+  const isExpired = function (pm) {
+    const card = pm.card || {};
+    if (!card.exp_year || !card.exp_month) return false; // unknown expiry: give it a shot
+    if (card.exp_year < nowYear) return true;
+    return card.exp_year === nowYear && card.exp_month < nowMonth;
+  };
+
+  // Newest-first (Stripe already returns this order; sorting makes it explicit),
+  // then hoist the default card to the front.
+  const ordered = pmData.slice().sort(function (a, b) { return (b.created || 0) - (a.created || 0); });
+  if (defaultPmId) {
+    const defaultIdx = ordered.findIndex(function (pm) { return pm.id === defaultPmId; });
+    if (defaultIdx > 0) ordered.unshift(ordered.splice(defaultIdx, 1)[0]);
+  }
+
+  // Collapse duplicates. Keeping the FIRST occurrence means the default card wins
+  // over its own re-added copies. Cards with no fingerprint key on their own id.
+  const seenFingerprints = {};
+  const unique = [];
+  let duplicatesDropped = 0;
+  for (const pm of ordered) {
+    const key = (pm.card && pm.card.fingerprint) ? `fp:${pm.card.fingerprint}` : `id:${pm.id}`;
+    if (seenFingerprints[key]) { duplicatesDropped++; continue; }
+    seenFingerprints[key] = true;
+    unique.push(pm);
+  }
+  if (duplicatesDropped > 0) {
+    logToSheet_(functionName, `Collapsed ${duplicatesDropped} duplicate card(s) by fingerprint.`, "DEBUG");
+  }
+
+  const fresh = unique.filter(function (pm) { return !isExpired(pm); });
+  const expired = unique.filter(isExpired);
+
+  let chosen = fresh;
+  if (fresh.length === 0 && expired.length > 0) {
+    logToSheet_(functionName, `Every card on file is expired. Attempting the newest one (${describe(expired[0])}) anyway so the decline is recorded in Stripe.`, "WARN");
+    chosen = [expired[0]];
+  } else if (expired.length > 0) {
+    logToSheet_(functionName, `Skipping ${expired.length} expired card(s).`, "DEBUG");
+  }
+
+  return chosen.map(function (pm) {
+    return { id: pm.id, label: describe(pm), isDefault: pm.id === defaultPmId };
+  });
+}
+
 /**
  * Resolves the "Date/Time Driver Paid" column (AD) for a given sheet.
  *
@@ -343,14 +473,20 @@ function getStripeCustomerIdFromBooking_(bookingId) {
 }
 
 /**
- * Attempts to create and confirm a Stripe Payment Intent off_session.
- * Tries all available card payment methods for the customer.
- * **REVISED: Removed error_on_requires_action parameter.**
+ * Attempts to create and confirm a Stripe Payment Intent off_session, cascading
+ * through the customer's saved cards until one succeeds.
+ *
+ * Cards are tried default-first then newest-first (see selectChargeCandidates_),
+ * deduped by fingerprint and filtered of expired cards. A soft decline moves to the
+ * next card; a hard decline, a non-card error, or an exception of unknown outcome
+ * stops the cascade so the row can fall to Collections. Returning success:false only
+ * after the wallet is exhausted keeps the caller's Paid/Collections logic unchanged.
+ *
  * @param {string} stripeKey The Stripe Secret Key.
  * @param {string} stripeCustomerId The Stripe Customer ID ('cus_...').
  * @param {number} amountInCents The amount to charge in cents.
  * @param {string} description The description for the charge.
- * @returns {object} { success: boolean, message: string, paymentIntentId: string|null }
+ * @returns {object} { success: boolean, message: string, paymentIntentId: string|null, cardsTried: number }
  */
 function attemptStripeCharge_(stripeKey, stripeCustomerId, amountInCents, description) {
     const functionName = "attemptStripeCharge_";
@@ -396,86 +532,126 @@ function attemptStripeCharge_(stripeKey, stripeCustomerId, amountInCents, descri
             return { success: false, message: "No saved cards found for customer.", paymentIntentId: null };
         }
 
-        const paymentMethodIds = pmResult.data.map(pm => pm.id);
-        logToSheet_(functionName, `Found ${paymentMethodIds.length} saved card(s) for ${stripeCustomerId}. Will attempt with first available.`, "DEBUG"); // Adjusted log, often only one attempt needed now
+        // --- Order the wallet: default card first, then newest-first ---
+        const defaultPmId = getDefaultPaymentMethodId_(stripeKey, stripeCustomerId);
+        const candidates = selectChargeCandidates_(pmResult.data, defaultPmId, functionName);
 
-        // --- Attempt Payment Intent Creation & Confirmation ---
-        logToSheet_(functionName, `Attempting Payment Intent (${amountInCents} cents) for Customer ${stripeCustomerId}`, "INFO");
-
-        // Try only the first available card (or iterate if first fails and you want redundancy)
-        // For simplicity, let's just try the first one found. Modify loop if needed.
-        const pmId = paymentMethodIds[0];
-        logToSheet_(functionName, `Attempting charge with first found PM ID: ${pmId}`, "INFO");
-        paymentIntentId = null; // Reset PI ID for attempt message
-
-        try {
-            const piPayload = {
-                amount: amountInCents,
-                currency: 'usd',
-                customer: stripeCustomerId,
-                payment_method: pmId,
-                description: description,
-                confirm: true,
-                off_session: true,
-                // --- REMOVED THIS LINE ---
-                // error_on_requires_action: true,
-                // -------------------------
-                // 'metadata[source_script]': 'TicketProcessing' // Optional metadata
-            };
-
-            const piOptions = {
-                method: 'post',
-                headers: {
-                    Authorization: 'Bearer ' + stripeKey,
-                    'Content-Type': 'application/x-www-form-urlencoded',
-                    'Stripe-Version': '2024-04-10' // Specify API version
-                },
-                payload: toUrlEncoded_(piPayload),
-                muteHttpExceptions: true
-            };
-
-            const piResponse = UrlFetchApp.fetch("https://api.stripe.com/v1/payment_intents", piOptions);
-            const piResponseCode = piResponse.getResponseCode();
-            const piResponseText = piResponse.getContentText();
-            const piResult = JSON.parse(piResponseText);
-
-            // Extract PI ID regardless of success/failure for logging
-            if (piResult && piResult.id) {
-               paymentIntentId = piResult.id;
-            } else if (piResult && piResult.error && piResult.error.payment_intent && piResult.error.payment_intent.id) {
-               paymentIntentId = piResult.error.payment_intent.id; // ID might be in error object
-            }
-            logToSheet_(functionName, `PI Attempt (PM: ${pmId}, PI: ${paymentIntentId || 'N/A'}) - Code: ${piResponseCode}, Status: ${piResult.status || (piResult.error ? 'Error' : 'Unknown')}`, "DEBUG");
-
-
-            if (piResult.status === "succeeded") {
-                paymentSuccess = true;
-                paymentResultMessage = "Payment successful!";
-                logToSheet_(functionName, `${paymentResultMessage} using PM ${pmId}. PI ID: ${paymentIntentId}`, "SUCCESS");
-                return { success: true, message: paymentResultMessage, paymentIntentId: paymentIntentId }; // Return success
-            } else {
-                // Handle failure (including requires_action, requires_payment_method etc.)
-                paymentSuccess = false;
-                let failureReason = "Unknown status or error";
-                if (piResult.error) {
-                     failureReason = piResult.error.message || `Code: ${piResult.error.code}`;
-                } else if (piResult.last_payment_error) { // Check last_payment_error as well
-                     failureReason = piResult.last_payment_error.message || `Code: ${piResult.last_payment_error.code}`;
-                } else if (piResult.status) {
-                     failureReason = `Status: ${piResult.status}`; // e.g., requires_action, requires_payment_method
-                }
-                paymentResultMessage = `Payment not successful with PM ${pmId}. Reason: ${failureReason}`;
-                logToSheet_(functionName, paymentResultMessage + (paymentIntentId ? ` (PI ID: ${paymentIntentId})` : ""), "WARN");
-                 return { success: false, message: paymentResultMessage, paymentIntentId: paymentIntentId }; // Return failure
-            }
-        } catch (e) {
-            // Error during a specific payment method attempt's fetch/parse
-            paymentSuccess = false;
-            paymentResultMessage = `Exception during payment attempt for PM ${pmId}: ${e.message}`;
-            logToSheet_(functionName, paymentResultMessage + (e.stack ? ` Stack: ${e.stack}`: ""), "ERROR");
-             return { success: false, message: paymentResultMessage, paymentIntentId: paymentIntentId }; // Return failure
+        if (candidates.length === 0) {
+            logToSheet_(functionName, `Customer ${stripeCustomerId} has cards on file but none were usable.`, "WARN");
+            return { success: false, message: "No usable cards found for customer.", paymentIntentId: null };
         }
-        // --- End Payment Method attempt (only trying first one now) ---
+
+        const attempts = candidates.slice(0, MAX_CARD_ATTEMPTS);
+        if (candidates.length > attempts.length) {
+            logToSheet_(functionName, `Customer ${stripeCustomerId} has ${candidates.length} usable card(s); capping this run at ${MAX_CARD_ATTEMPTS}. Cards not attempted: ${candidates.length - attempts.length}.`, "WARN");
+        }
+
+        // --- Attempt Payment Intent Creation & Confirmation, card by card ---
+        logToSheet_(functionName, `Attempting Payment Intent (${amountInCents} cents) for Customer ${stripeCustomerId} across up to ${attempts.length} card(s).`, "INFO");
+
+        let cardsTried = 0;
+        let lastFailureReason = "No card produced a result.";
+
+        for (let a = 0; a < attempts.length; a++) {
+            const candidate = attempts[a];
+            const pmId = candidate.id;
+            cardsTried++;
+            logToSheet_(functionName, `Card ${cardsTried} of ${attempts.length}: attempting charge with ${candidate.label}${candidate.isDefault ? ' [default]' : ''}.`, "INFO");
+            paymentIntentId = null; // Reset PI ID for this attempt
+
+            try {
+                const piPayload = {
+                    amount: amountInCents,
+                    currency: 'usd',
+                    customer: stripeCustomerId,
+                    payment_method: pmId,
+                    description: description,
+                    confirm: true,
+                    off_session: true
+                };
+
+                const piOptions = {
+                    method: 'post',
+                    headers: {
+                        Authorization: 'Bearer ' + stripeKey,
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                        'Stripe-Version': '2024-04-10' // Specify API version
+                    },
+                    payload: toUrlEncoded_(piPayload),
+                    muteHttpExceptions: true
+                };
+
+                const piResponse = UrlFetchApp.fetch("https://api.stripe.com/v1/payment_intents", piOptions);
+                const piResponseCode = piResponse.getResponseCode();
+                const piResponseText = piResponse.getContentText();
+                const piResult = JSON.parse(piResponseText);
+
+                // Extract PI ID regardless of success/failure for logging
+                if (piResult && piResult.id) {
+                   paymentIntentId = piResult.id;
+                } else if (piResult && piResult.error && piResult.error.payment_intent && piResult.error.payment_intent.id) {
+                   paymentIntentId = piResult.error.payment_intent.id; // ID might be in error object
+                }
+                logToSheet_(functionName, `PI Attempt (PM: ${pmId}, PI: ${paymentIntentId || 'N/A'}) - Code: ${piResponseCode}, Status: ${piResult.status || (piResult.error ? 'Error' : 'Unknown')}`, "DEBUG");
+
+                if (piResult.status === "succeeded") {
+                    paymentSuccess = true;
+                    paymentResultMessage = `Payment successful on card ${cardsTried} of ${attempts.length} (${candidate.label}).`;
+                    logToSheet_(functionName, `${paymentResultMessage} PI ID: ${paymentIntentId}`, "SUCCESS");
+                    return { success: true, message: paymentResultMessage, paymentIntentId: paymentIntentId, cardsTried: cardsTried };
+                }
+
+                // --- Not successful. Decide whether the NEXT card is worth trying. ---
+                // Stripe reports a declined card either as a 402 `error` (card_error) or,
+                // on a 200, as `last_payment_error` alongside a non-succeeded status.
+                const err = piResult.error || piResult.last_payment_error || null;
+                const errType = err ? err.type : null;
+                const declineCode = err ? err.decline_code : null;
+
+                let failureReason = "Unknown status or error";
+                if (err) {
+                    failureReason = err.message || `Code: ${err.code || 'n/a'}`;
+                    if (declineCode) failureReason += ` (decline_code: ${declineCode})`;
+                } else if (piResult.status) {
+                    failureReason = `Status: ${piResult.status}`; // e.g. requires_action, requires_payment_method
+                }
+                lastFailureReason = failureReason;
+                logToSheet_(functionName, `Card ${cardsTried} (${candidate.label}) declined: ${failureReason}${paymentIntentId ? ` (PI ID: ${paymentIntentId})` : ""}`, "WARN");
+
+                // Hard declines mean the card is compromised or the issuer wants it taken.
+                // Continuing to hammer the same customer risks tripping Stripe's card-testing
+                // block, so stop the cascade for this row and let it fall to Collections.
+                if (declineCode && HARD_DECLINE_CODES.indexOf(declineCode) !== -1) {
+                    logToSheet_(functionName, `Hard decline (${declineCode}) on ${candidate.label}. Stopping cascade for customer ${stripeCustomerId}.`, "WARN");
+                    break;
+                }
+
+                // A non-card error (bad amount, bad key, customer gone, rate limit) will fail
+                // identically on every other card. Trying the rest just burns quota.
+                if (errType && errType !== 'card_error') {
+                    logToSheet_(functionName, `Non-card error (${errType}) on ${candidate.label}. Stopping cascade for customer ${stripeCustomerId}.`, "ERROR");
+                    break;
+                }
+
+                // Soft decline (insufficient_funds, expired_card, authentication_required, ...)
+                // — move on to the next card on file.
+
+            } catch (e) {
+                // muteHttpExceptions swallows HTTP errors, so reaching here means the request
+                // or the response parse itself blew up and we do NOT know whether Stripe
+                // processed the charge. Stop rather than risk charging a second card.
+                lastFailureReason = `Exception during payment attempt for ${candidate.label}: ${e.message}`;
+                logToSheet_(functionName, lastFailureReason + (e.stack ? ` Stack: ${e.stack}` : ""), "ERROR");
+                logToSheet_(functionName, `Charge outcome for ${candidate.label} is UNKNOWN. Stopping cascade for customer ${stripeCustomerId} to avoid a double charge.`, "ERROR");
+                break;
+            }
+        }
+        // --- End card cascade: every attempted card failed ---
+
+        paymentSuccess = false;
+        paymentResultMessage = `No card succeeded after ${cardsTried} attempt(s) of ${attempts.length} available. Last reason: ${lastFailureReason}`;
+        logToSheet_(functionName, `${paymentResultMessage} (Customer: ${stripeCustomerId})`, "WARN");
+        return { success: false, message: paymentResultMessage, paymentIntentId: paymentIntentId, cardsTried: cardsTried };
 
     } catch (outerError) {
         // Error fetching payment methods or other setup issue
