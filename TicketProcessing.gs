@@ -939,6 +939,77 @@ function addMultipleTicketData(dataPackage) {
 
 
 /**
+ * Writes one violation row to `sheet` and PROVES it landed before returning.
+ *
+ * Why this exists: on 2026-08-20 citation 1DTI-26-023963 was reported as
+ * "Appended row 509 ... Success: 1, Errors: 0" but never appeared on the sheet.
+ * A second person was editing the same tab in the same second; the unflushed
+ * appendRow() was lost, and `getLastRow()` returned the pre-existing last row
+ * (509), so the script had no idea. Document history for that revision shows
+ * one single edit — the log write — and nothing on the violations tab.
+ *
+ * Three defences, in order:
+ *   1. LockService document lock, so concurrent script runs serialise.
+ *   2. Explicit setValues() at a computed row + SpreadsheetApp.flush(), so the
+ *      write is committed before we look at it.
+ *   3. Read the Violation ID back out of the cell we claim to have written. If
+ *      it is not there, retry once; if it still is not there, THROW so the
+ *      caller counts an error and the operator sees a failure, not a green tick.
+ *
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet Destination tab.
+ * @param {Array} rowData Row values, NUM_COLUMNS wide.
+ * @param {string} violationId Violation ID used as the read-back receipt.
+ * @returns {number} 1-based index of the row that verifiably holds the data.
+ * @throws {Error} If the row cannot be proven present after a retry.
+ */
+function writeViolationRowVerified_(sheet, rowData, violationId) {
+    const functionName = "writeViolationRowVerified_";
+    const receipt = String(violationId == null ? '' : violationId).trim();
+    const lock = LockService.getDocumentLock();
+    let haveLock = false;
+    try {
+        haveLock = lock.tryLock(30000);
+    } catch (lockErr) {
+        haveLock = false;
+    }
+    if (!haveLock) {
+        logToSheet_(functionName, `Could not obtain document lock within 30s for Viol ID ${receipt || 'N/A'}; writing unlocked and verifying.`, "WARN");
+    }
+
+    try {
+        for (let attempt = 1; attempt <= 2; attempt++) {
+            const targetRow = sheet.getLastRow() + 1;
+            // Grow the grid explicitly rather than relying on appendRow's implicit
+            // insert, which is what gets rebased away under concurrent editing.
+            const shortfall = targetRow - sheet.getMaxRows();
+            if (shortfall > 0) sheet.insertRowsAfter(sheet.getMaxRows(), shortfall);
+
+            sheet.getRange(targetRow, 1, 1, rowData.length).setValues([rowData]);
+            SpreadsheetApp.flush();
+
+            // Receipt check: did the Violation ID actually land where we put it?
+            if (!receipt) {
+                // Nothing to verify against — fall back to "the row is not empty".
+                const written = sheet.getRange(targetRow, 1, 1, rowData.length).getValues()[0];
+                if (written.some(function (v) { return v !== '' && v !== null; })) return targetRow;
+            } else {
+                const readBack = String(sheet.getRange(targetRow, COL.VIOLATION_ID).getValue()).trim();
+                if (readBack === receipt) return targetRow;
+                logToSheet_(functionName, `Verification FAILED on attempt ${attempt} for Viol ID ${receipt}: row ${targetRow} col ${COL.VIOLATION_ID} reads "${readBack}". Retrying.`, "WARN");
+            }
+        }
+
+        throw new Error(
+            `Row for Violation ID ${receipt || 'N/A'} did not persist to sheet "${sheet.getName()}" after 2 attempts. ` +
+            `Another session is very likely editing this tab — nothing was written. Re-run the upload once the sheet is idle.`);
+    } finally {
+        if (haveLock) {
+            try { lock.releaseLock(); } catch (relErr) { /* best effort */ }
+        }
+    }
+}
+
+/**
  * Helper function to append and format a single violation row.
  * Performs lookups, applies formatting, and handles late notice styling.
  * Includes robust date/time parsing.
@@ -1032,9 +1103,11 @@ function appendAndFormatViolationRow_(violationData, pdfLink, isLateNotice) {
     // --- Write to Target Sheet (tolls → Tolls tab, tickets → New tab) ---
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     const sheet = getDestinationSheet_(ss, isToll);
-    // Consider batching appends if performance is still an issue
-    sheet.appendRow(rowData);
-    const newRowIndex = sheet.getLastRow();
+    // appendRow() alone is not safe here: when a human is editing this sheet in
+    // another session at the same moment, the append can be rebased away while
+    // getLastRow() still reports the (unchanged) last row — the row silently
+    // never lands and the caller reports success. See writeViolationRowVerified_.
+    const newRowIndex = writeViolationRowVerified_(sheet, rowData, violationData.violationId);
     logToSheet_(functionName, `Appended row ${newRowIndex} for Violation ID: ${violationData.violationId || 'N/A'}`, "DEBUG");
 
 
@@ -1362,6 +1435,58 @@ function formatValueForSheet_(value) {
 // ====================================================================
 
 /**
+ * Canonical form of a plate for OCR-tolerant comparison. Strips every
+ * non-alphanumeric character and folds the glyph pairs OCR routinely swaps
+ * (I/1, L/1, O/0, Q/0, S/5, B/8, Z/2, G/6) onto a single representative.
+ *
+ * "EVITO7", "EV 1TO7" and "EVIT07" all canonicalize to "EV1T07".
+ *
+ * Only ever used as a FALLBACK after exact matching fails, and only accepted
+ * when exactly one fleet vehicle matches — see getVehicleNumberFromFleetSheet_.
+ * @param {string} plate
+ * @returns {string} Canonical plate, or '' when there is nothing to compare.
+ */
+function canonicalizePlateForFuzzy_(plate) {
+  if (!plate) return '';
+  const stripped = String(plate).toUpperCase().replace(/[^A-Z0-9]/g, '');
+  if (stripped.length < 4) return ''; // too short to fold safely
+  return stripped
+    .replace(/[IL]/g, '1')
+    .replace(/[OQ]/g, '0')
+    .replace(/S/g, '5')
+    .replace(/B/g, '8')
+    .replace(/Z/g, '2')
+    .replace(/G/g, '6');
+}
+
+// Placeholder text that appears in the fleet sheet's plate columns. Never treat
+// these as a plate — dozens of vehicles share them and they would collide.
+const FLEET_PLATE_PLACEHOLDER_ = /PLATE NOT IN DATABASE|VIN MISSING/i;
+
+/**
+ * True when two canonical plates should be considered the same vehicle.
+ *
+ * Exact canonical equality, OR one canonical form is a suffix of the other —
+ * the fleet sheet stores Hawai'i EV plates without their "EV" prefix (vehicle
+ * HI - 1022 is recorded as plate "1T07" while the citation reads "EV 1T07"),
+ * so a prefix-tolerant compare is required to attribute those at all.
+ *
+ * The shorter side must be >= 4 characters. Measured against the live roster
+ * (169 plates) this produces ZERO ambiguous matches; the caller still refuses
+ * any match that resolves to more than one vehicle.
+ * @param {string} a Canonical plate.
+ * @param {string} b Canonical plate.
+ * @returns {boolean}
+ */
+function plateFuzzyMatches_(a, b) {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  const shorter = a.length < b.length ? a : b;
+  const longer = a.length < b.length ? b : a;
+  return shorter.length >= 4 && longer.slice(-shorter.length) === shorter;
+}
+
+/**
  * Looks up the Vehicle Number (Col A) in the Fleet Sheet based on License Plate.
  * First checks Column F, then falls back to checking Column I.
  * Cleans license plate input (removes trailing state).
@@ -1417,6 +1542,10 @@ function getVehicleNumberFromFleetSheet_(licensePlate) {
     const colIIndex = 8; // Column I (0-based)
     const colAIndex = 0; // Column A (0-based) Vehicle #
     let foundVehicleNumber = null;
+    // Fuzzy fallback candidates, gathered during this same pass so the fleet
+    // sheet is never re-read. Each entry: { vehicleNumber, plate, row }.
+    const fuzzyTarget = canonicalizePlateForFuzzy_(cleanedPlate);
+    const fuzzyHits = [];
 
     logToSheet_(functionName, `Read ${data.length} rows from Fleet sheet. Searching for CLEANED plate: ${cleanedPlate}`, "DEBUG");
 
@@ -1453,7 +1582,37 @@ function getVehicleNumberFromFleetSheet_(licensePlate) {
             }
          }
       }
+
+      // Record near-misses for the fuzzy fallback below. Citation 1DTI-26-023963
+      // read as "EV 1TO7" against fleet plate "1T07" (vehicle HI - 1022) matched
+      // nothing exactly, so the row would have been filed with no vehicle,
+      // no booking and no responsible driver.
+      if (foundVehicleNumber === null && fuzzyTarget && vehicleNumberInRow) {
+        const plateI = row[colIIndex] ? String(row[colIIndex]).trim().toUpperCase() : '';
+        [plateInF, plateI].forEach(function (candidate) {
+          if (!candidate || FLEET_PLATE_PLACEHOLDER_.test(candidate)) return;
+          if (plateFuzzyMatches_(fuzzyTarget, canonicalizePlateForFuzzy_(candidate))) {
+            fuzzyHits.push({ vehicleNumber: vehicleNumberInRow, plate: candidate, row: i + 1 });
+          }
+        });
+      }
     } // End loop
+
+    // --- Fuzzy fallback: only when it is UNAMBIGUOUS ---
+    if (foundVehicleNumber === null && fuzzyHits.length > 0) {
+      const distinct = [];
+      fuzzyHits.forEach(function (hit) {
+        if (distinct.indexOf(hit.vehicleNumber) === -1) distinct.push(hit.vehicleNumber);
+      });
+      if (distinct.length === 1) {
+        foundVehicleNumber = distinct[0];
+        logToSheet_(functionName, `FUZZY match: OCR plate "${cleanedPlate}" resolved to fleet plate "${fuzzyHits[0].plate}" (Vehicle # ${foundVehicleNumber}, fleet row ${fuzzyHits[0].row}). Confirm the plate on the citation.`, "WARN");
+      } else {
+        // Two different vehicles collapse to the same canonical form — guessing
+        // here would attach a citation to the wrong driver. Leave it #N/A.
+        logToSheet_(functionName, `FUZZY match AMBIGUOUS for "${cleanedPlate}": candidates ${distinct.join(', ')}. Leaving Vehicle # unresolved.`, "WARN");
+      }
+    }
 
     // --- Update Cache ---
     if (foundVehicleNumber !== null) {
