@@ -1641,6 +1641,16 @@ function getVehicleNumberFromFleetSheet_(licensePlate) {
 // ====================================================================
 
 /**
+ * Shift a YYYY-MM-DD string by a whole number of days, returning YYYY-MM-DD.
+ * Anchored at noon UTC so a DST transition can never bump the result a day.
+ */
+function shiftDateOnly_(ymd, days) {
+  const d = new Date(`${ymd}T12:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().substring(0, 10);
+}
+
+/**
  * Connects to the Envoy DB and finds booking/driver details based on vehicle and time.
  * Handles timezone conversion.
  * @param {string} vehicleNumber The vehicle number (e.g., "636").
@@ -1683,7 +1693,15 @@ function getDriverBookingInfo_(vehicleNumber, violationDateTimeLocalStr) {
     logToSheet_(functionName, "DB Connection successful.", "INFO");
 
     // --- Query 1: Find potential bookings around the violation date ---
+    // violationDateOnly is the violation's date in the PROPERTY's timezone, but
+    // Envoy_Booking_View.start_date/end_date are Pacific wall-clock (see the "PST"
+    // parsing below). For an Eastern property a 00:00-02:59 violation still falls on
+    // the PREVIOUS Pacific day, so an exact-date window drops the real booking before
+    // the timestamp comparison further down ever sees it. Pad the window by a day on
+    // each side and let that comparison, which is timezone-correct, do the deciding.
     const violationDateOnly = violationDateTimeLocalStr.substring(0, 10); // YYYY-MM-DD
+    const windowStart = shiftDateOnly_(violationDateOnly, -1);
+    const windowEnd = shiftDateOnly_(violationDateOnly, 1);
     const bookingSql = `
       SELECT ref_number, first_name, last_name, Email, Property, start_date, end_date
       FROM Envoy_Booking_View
@@ -1694,10 +1712,10 @@ function getDriverBookingInfo_(vehicleNumber, violationDateTimeLocalStr) {
 
     stmt = conn.prepareStatement(bookingSql);
     stmt.setString(1, vehicleNameDbFormat);
-    stmt.setString(2, violationDateOnly);
-    stmt.setString(3, violationDateOnly);
+    stmt.setString(2, windowEnd);
+    stmt.setString(3, windowStart);
 
-    logToSheet_(functionName, `Executing Booking Query for vehicle ${vehicleNameDbFormat}, date ${violationDateOnly}`, "DEBUG");
+    logToSheet_(functionName, `Executing Booking Query for vehicle ${vehicleNameDbFormat}, window ${windowStart}..${windowEnd} (violation local date ${violationDateOnly})`, "DEBUG");
     rs = stmt.executeQuery();
 
     while (rs.next()) {
@@ -1714,32 +1732,37 @@ function getDriverBookingInfo_(vehicleNumber, violationDateTimeLocalStr) {
     logToSheet_(functionName, `Found ${bookingResults.length} potential booking(s) around the violation date.`, "INFO");
 
     if (bookingResults.length === 0) {
-      return { error: `No bookings found for vehicle ${vehicleNameDbFormat} around ${violationDateOnly}.` };
+      return { error: `No bookings found for vehicle ${vehicleNameDbFormat} between ${windowStart} and ${windowEnd}.` };
     }
 
     // --- Iterate through potential bookings to find the correct one using timezone ---
     let matchedBooking = null;
+    // The widened window returns every booking on the vehicle across three days, and they
+    // almost always share one property - memoize so Query 2 runs once, not per booking.
+    const tzByProperty = {};
     for (const booking of bookingResults) {
        logToSheet_(functionName, `Checking booking ID: ${booking.ref_number}, Property: ${booking.Property}`, "DEBUG");
 
        // --- Query 2: Get Timezone for the booking's property ---
-       const propertySql = "SELECT tz_id FROM properties WHERE name = ?";
-       propStmt = conn.prepareStatement(propertySql);
-       propStmt.setString(1, booking.Property);
-       propRs = propStmt.executeQuery();
-
        let propertyTzId = null;
-       if (propRs.next()) {
-         propertyTzId = propRs.getString("tz_id");
-         logToSheet_(functionName, `Found timezone '${propertyTzId}' for property '${booking.Property}'.`, "DEBUG");
+       if (Object.prototype.hasOwnProperty.call(tzByProperty, booking.Property)) {
+         propertyTzId = tzByProperty[booking.Property];
        } else {
-         logToSheet_(functionName, `Timezone not found for property '${booking.Property}'. Skipping this booking check.`, "WARN");
+         const propertySql = "SELECT tz_id FROM properties WHERE name = ?";
+         propStmt = conn.prepareStatement(propertySql);
+         propStmt.setString(1, booking.Property);
+         propRs = propStmt.executeQuery();
+
+         if (propRs.next()) {
+           propertyTzId = propRs.getString("tz_id");
+           logToSheet_(functionName, `Found timezone '${propertyTzId}' for property '${booking.Property}'.`, "DEBUG");
+         } else {
+           logToSheet_(functionName, `Timezone not found for property '${booking.Property}'. Skipping this booking check.`, "WARN");
+         }
+         tzByProperty[booking.Property] = propertyTzId;
          closeQuietly_(propRs);
          closeQuietly_(propStmt);
-         continue;
        }
-       closeQuietly_(propRs);
-       closeQuietly_(propStmt);
 
        if (!propertyTzId) continue;
 
