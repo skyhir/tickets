@@ -677,45 +677,57 @@ function saveRotatedTicketPdf(fileId, base64Data) {
   }
 }
 // ====================================================================
-// Gemini API Interaction
+// Ticket AI extraction (Claude Haiku 5.5 first, Gemini fallback)
 // ====================================================================
 
-/**
- * Analyzes a ticket PDF using the Gemini API to extract specific fields,
- * including a suggested short agency name for filenames.
- * Handles cases where no violations matching the schema are found (e.g., toll statements).
- * @param {string} fileId The Google Drive File ID of the PDF ticket.
- * @returns {object} { success: boolean, data: object|null, message: string|null }
- */
-function analyzeTicketWithGemini_(fileId) {
-  const functionName = "analyzeTicketWithGemini_";
-  logToSheet_(functionName, `Starting Gemini analysis for file ID: ${fileId}`, "INFO");
+const TICKET_GEMINI_MODEL = "gemini-2.5-flash";
+// Multi-violation toll statements can list dozens of line items; thinking
+// shares this budget. stop_reason "max_tokens" falls back to Gemini.
+const TICKET_CLAUDE_MAX_TOKENS = 16000;
 
-const apiKey =
-  GEMINI_API_KEY_CACHE || (GEMINI_API_KEY_CACHE = getScriptProperty_('GEMINI_API_KEY'));
-
-  if (!apiKey) {
-    logToSheet_(functionName, "Gemini API Key is missing in Script Properties.", "ERROR");
-    return { success: false, data: null, message: "Gemini API Key is missing." };
-  }
-
-  const model = "gemini-2.5-flash";
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-
-  try {
-    // Get File Blob
-    const file = DriveApp.getFileById(fileId);
-    if (!file) throw new Error(`Could not find file in Drive with ID: ${fileId}`);
-    const blob = file.getBlob();
-    if (blob.getContentType() !== 'application/pdf') {
-        logToSheet_(functionName, `File is not a PDF. MimeType: ${blob.getContentType()}`, "ERROR");
-        throw new Error(`Invalid file type. Expected PDF, got ${blob.getContentType()}`);
+/** Structured-output schema for Claude (standard JSON Schema; mirrors the prompt's keys). */
+const TICKET_EXTRACTION_SCHEMA = (function () {
+  const nullableString = { anyOf: [{ type: "string" }, { type: "null" }] };
+  const nullableNumber = { anyOf: [{ type: "number" }, { type: "null" }] };
+  const violationProps = {
+    isToll: { type: "boolean" },
+    licensePlate: nullableString,
+    licenseState: nullableString,
+    violationDate: nullableString,
+    violationTime: nullableString,
+    violationId: nullableString,
+    pinNumber: nullableString,
+    issuingAgency: nullableString,
+    agencyShortName: nullableString,
+    violationType: nullableString,
+    violationLocation: nullableString,
+    originalPenaltyAmount: nullableNumber,
+    additionalPenaltyAmount: nullableNumber,
+    paymentWebsite: nullableString,
+    dueDate: nullableString
+  };
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["isLateNotice", "violations"],
+    properties: {
+      isLateNotice: { type: "boolean" },
+      violations: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: Object.keys(violationProps),
+          properties: violationProps
+        }
+      }
     }
-    const base64Data = Utilities.base64Encode(blob.getBytes());
-    logToSheet_(functionName, `File Name: ${file.getName()}, Size: ${blob.getBytes().length} bytes.`, "DEBUG");
+  };
+})();
 
-    // --- ** REVISED Gemini Prompt - Accepts Tolls, less strict on date/time output format ** ---
-    const prompt = `Analyze the attached traffic, parking ticket, OR toll statement PDF. Identify if it contains one or multiple distinct violations/tolls.
+/** The extraction prompt (provider-neutral; ported verbatim from the Gemini prompt). */
+function buildTicketExtractionPrompt_() {
+  return `Analyze the attached traffic, parking ticket, OR toll statement PDF. Identify if it contains one or multiple distinct violations/tolls.
 Determine if the document appears to be a standard initial notice or a LATE / SECOND / FINAL notice.
 
 Format the output strictly as a JSON object with the following top-level keys:
@@ -758,12 +770,43 @@ Example (Parking Ticket — non-toll):
     { "isToll": false, "licensePlate": "8ABC123", "licenseState": "CA", "violationDate": "02/14/2026", "violationTime": "10:32 AM", "violationId": "SF-12345678", "pinNumber": null, "issuingAgency": "San Francisco Municipal Transportation Agency", "agencyShortName": "SFMTA", "violationType": "Expired Meter", "violationLocation": "100 Market St", "originalPenaltyAmount": 87.00, "additionalPenaltyAmount": 0, "paymentWebsite": "sfmta.com", "dueDate": "03/16/2026" }
   ]
 }`;
+}
+
+/** Shape check shared by both providers. Returns an error string, or null when usable. */
+function ticketExtractionShapeError_(data) {
+  if (!data || typeof data.isLateNotice === 'undefined' || !Array.isArray(data.violations)) {
+    return "missing expected top-level structure (isLateNotice, violations array)";
+  }
+  return null;
+}
+
+/** Claude path only (used by the fallback wrapper's caller and by the compare tool). */
+function ticketClaudeRequest_(base64Data) {
+  return {
+    prompt: buildTicketExtractionPrompt_(),
+    pdfBase64: base64Data,
+    jsonSchema: TICKET_EXTRACTION_SCHEMA,
+    maxTokens: TICKET_CLAUDE_MAX_TOKENS,
+    effort: "low",
+    expectJson: true
+  };
+}
+
+/**
+ * The existing Gemini path, unchanged apart from being callable on its own.
+ * @returns {{data: object, usage: object}} parsed outer object (not yet validated)
+ * @throws Error on any API / parse failure
+ */
+function ticketGeminiExtract_(apiKey, base64Data) {
+  const functionName = "ticketGeminiExtract_";
+  const model = TICKET_GEMINI_MODEL;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
     // --- Construct Payload ---
     const payload = {
       "contents": [{
         "parts": [
-          { "text": prompt },
+          { "text": buildTicketExtractionPrompt_() },
           { "inline_data": { "mime_type": "application/pdf", "data": base64Data } }
         ]
       }],
@@ -820,20 +863,61 @@ Example (Parking Ticket — non-toll):
         logToSheet_(functionName, `Cleaned text received for parsing: ${generatedJsonText.substring(0,1000)}`, "DEBUG");
         throw new Error("Failed to parse the JSON output provided by Gemini.");
     }
+    return { data: extractedOuterData, usage: responseData.usageMetadata || null };
+}
+
+/**
+ * Analyzes a ticket PDF to extract specific fields, including a suggested short
+ * agency name for filenames. Claude Haiku 5.5 first; the original Gemini call
+ * runs when ANTHROPIC_API_KEY is not set, or for this request when Claude fails
+ * (see aiWithFallback_ in claudeClient.gs). Name kept so callers don't change.
+ * Handles cases where no violations matching the schema are found (e.g., toll statements).
+ * @param {string} fileId The Google Drive File ID of the PDF ticket.
+ * @returns {object} { success: boolean, data: object|null, message: string|null,
+ *                     provider: string|null, modelUsed: string|null, fallbackReason: string|null }
+ */
+function analyzeTicketWithGemini_(fileId) {
+  const functionName = "analyzeTicketWithGemini_";
+  logToSheet_(functionName, `Starting AI ticket analysis for file ID: ${fileId}`, "INFO");
+
+  try {
+    // Get File Blob
+    const file = DriveApp.getFileById(fileId);
+    if (!file) throw new Error(`Could not find file in Drive with ID: ${fileId}`);
+    const blob = file.getBlob();
+    if (blob.getContentType() !== 'application/pdf') {
+        logToSheet_(functionName, `File is not a PDF. MimeType: ${blob.getContentType()}`, "ERROR");
+        throw new Error(`Invalid file type. Expected PDF, got ${blob.getContentType()}`);
+    }
+    const base64Data = Utilities.base64Encode(blob.getBytes());
+    logToSheet_(functionName, `File Name: ${file.getName()}, Size: ${blob.getBytes().length} bytes.`, "DEBUG");
+
+    const ai = aiWithFallback_({
+      label: `${functionName}(${fileId})`,
+      claude: ticketClaudeRequest_(base64Data),
+      validate: (res) => ticketExtractionShapeError_(res.json),
+      geminiKey: () => GEMINI_API_KEY_CACHE || (GEMINI_API_KEY_CACHE = getScriptProperty_('GEMINI_API_KEY')),
+      gemini: (key) => ticketGeminiExtract_(key, base64Data).data,
+      geminiModel: TICKET_GEMINI_MODEL,
+      log: (level, msg) => logToSheet_(functionName, msg, level)
+    });
+    const extractedOuterData = ai.value;
+    const by = `${ai.provider === 'anthropic' ? 'Claude' : 'Gemini'} (${ai.model})`;
 
     // --- **REVISED Validation** ---
     // Check for the main keys, but allow violations array to be empty
-    if (!extractedOuterData || typeof extractedOuterData.isLateNotice === 'undefined' || !Array.isArray(extractedOuterData.violations)) {
-         logToSheet_(functionName, "Gemini response missing expected top-level structure (isLateNotice, violations array). Data: " + JSON.stringify(extractedOuterData), "ERROR");
-         throw new Error("Gemini response structure is invalid (missing isLateNotice or violations array).");
+    const shapeError = ticketExtractionShapeError_(extractedOuterData);
+    if (shapeError) {
+         logToSheet_(functionName, `${by} response ${shapeError}. Data: ` + JSON.stringify(extractedOuterData), "ERROR");
+         throw new Error(`${by} response structure is invalid (missing isLateNotice or violations array).`);
     }
 
     // If violations array is empty, log a specific message but consider it a successful analysis
     if (extractedOuterData.violations.length === 0) {
-        logToSheet_(functionName, "Gemini Analysis SUCCESSFUL, but returned 0 violations/tolls matching schema. This might be expected for certain documents (e.g., informational notices, non-violation/toll statements).", "WARN");
+        logToSheet_(functionName, `${by} Analysis SUCCESSFUL, but returned 0 violations/tolls matching schema. This might be expected for certain documents (e.g., informational notices, non-violation/toll statements).`, "WARN");
         // Proceed, but later steps (renaming, row adding) might be skipped if they rely on violation data.
     } else {
-        logToSheet_(functionName, `Gemini Analysis SUCCESS. Late Notice: ${extractedOuterData.isLateNotice}, Violations/Tolls Found: ${extractedOuterData.violations.length}`, "SUCCESS");
+        logToSheet_(functionName, `${by} Analysis SUCCESS. Late Notice: ${extractedOuterData.isLateNotice}, Violations/Tolls Found: ${extractedOuterData.violations.length}`, "SUCCESS");
         // Basic validation/cleaning for each violation in the array
         extractedOuterData.violations.forEach((violation, index) => {
             // Validate mandatory fields for renaming (log warning if missing)
@@ -843,7 +927,7 @@ Example (Parking Ticket — non-toll):
             // Ensure amounts are numbers
             violation.originalPenaltyAmount = parseFloat(violation.originalPenaltyAmount) || 0;
             violation.additionalPenaltyAmount = parseFloat(violation.additionalPenaltyAmount) || 0;
-            // Split state out of plate when Gemini merged them ("FL 22DWCE" -> plate "22DWCE", state "FL").
+            // Split state out of plate when the model merged them ("FL 22DWCE" -> plate "22DWCE", state "FL").
             normalizePlateAndState_(violation);
             // Add more validation per violation if needed (e.g., date/time string format checks could go here)
         });
@@ -852,17 +936,74 @@ Example (Parking Ticket — non-toll):
     return {
         success: true,
         data: extractedOuterData, // Return the whole outer object
-        message: `Ticket analyzed by Gemini. Found ${extractedOuterData.violations.length} violation(s)/toll(s).`
+        provider: ai.provider,
+        modelUsed: ai.model,
+        fallbackReason: ai.fallbackReason,
+        message: `Ticket analyzed by ${by}. Found ${extractedOuterData.violations.length} violation(s)/toll(s).`
     };
 
   } catch (e) {
-    logToSheet_(functionName, `Error during Gemini analysis: ${e.toString()}` + (e.stack ? ` Stack: ${e.stack}` : ""), "ERROR");
+    logToSheet_(functionName, `Error during AI ticket analysis: ${e.toString()}` + (e.stack ? ` Stack: ${e.stack}` : ""), "ERROR");
     return {
         success: false,
         data: null,
-        message: `Gemini analysis failed: ${e.message}`
+        provider: null,
+        modelUsed: null,
+        fallbackReason: null,
+        message: `AI analysis failed: ${e.message}`
     };
   }
+}
+
+/**
+ * ONE-OFF, run by hand from the Apps Script editor: side-by-side Claude vs
+ * Gemini on the most recent ticket PDFs in the "Traffic Tickets" folder.
+ * Read-only (no renames, no sheet writes); writes one Markdown report to My
+ * Drive and logs its URL. Needs both ANTHROPIC_API_KEY and GEMINI_API_KEY.
+ * Claude cost is about $0.002 per ticket. Stops early near the 6-minute limit.
+ * @param {number=} limit how many PDFs (default 12)
+ */
+function compareTicketExtractionClaudeVsGemini(limit) {
+  limit = limit || 12;
+  const started = Date.now();
+  const geminiKey = getScriptProperty_('GEMINI_API_KEY');
+  if (!getAnthropicApiKey_() || !geminiKey) throw new Error("Set both ANTHROPIC_API_KEY and GEMINI_API_KEY in Script Properties first.");
+
+  const folders = DriveApp.getFoldersByName(TICKET_DRIVE_FOLDER_NAME);
+  if (!folders.hasNext()) throw new Error(`Folder "${TICKET_DRIVE_FOLDER_NAME}" not found.`);
+  const files = [];
+  const it = folders.next().getFilesByType(MimeType.PDF);
+  while (it.hasNext()) files.push(it.next());
+  files.sort((a, b) => b.getDateCreated() - a.getDateCreated());
+
+  const rows = [];
+  for (const file of files.slice(0, limit)) {
+    if (Date.now() - started > 4.5 * 60 * 1000) break;
+    const base64Data = Utilities.base64Encode(file.getBlob().getBytes());
+    const row = { name: file.getName() };
+    const c = callClaude_(ticketClaudeRequest_(base64Data));
+    const cErr = c.ok ? ticketExtractionShapeError_(c.json) : c.failure;
+    row.claudeOk = !cErr;
+    row.claudeMs = c.latencyMs;
+    row.inTok = c.usage ? c.usage.input_tokens : null;
+    row.outTok = c.usage ? c.usage.output_tokens : null;
+    row.costUsd = c.costUsd;
+    const g0 = Date.now();
+    let g = null;
+    try {
+      g = ticketGeminiExtract_(geminiKey, base64Data).data;
+      row.geminiOk = !ticketExtractionShapeError_(g);
+    } catch (e) {
+      row.geminiOk = false;
+      row.note = String(e.message || e).substring(0, 200);
+    }
+    row.geminiMs = Date.now() - g0;
+    if (!row.claudeOk) row.note = claudeResultSummary_(c);
+    if (row.claudeOk && row.geminiOk) row.diffs = claudeCompareDiff_(g, c.json);
+    rows.push(row);
+  }
+  const md = claudeCompareMarkdown_(`tickets: ticket/toll PDF extraction (${rows.length} files)`, rows);
+  return claudeCompareWriteReport_(`gas-tickets-compare-${new Date().toISOString().slice(0, 10)}.md`, md);
 }
 
 // ====================================================================

@@ -7,7 +7,8 @@
     "pull": "clasp pull",
     "push": "clasp push",
     "push:watch": "clasp push --watch",
-    "open": "clasp open"
+    "open": "clasp open",
+    "test": "node tests/claudeClient.test.js && node tests/ticketExtraction.test.js"
   },
   "devDependencies": {
     "@google/clasp": "^3.3.0"
