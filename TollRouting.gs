@@ -39,7 +39,9 @@ const CT_LOCAL_FORMAT_ = "h:mma 'on' EEEE, MMMM d, yyyy";
 const TOLLS_AGENCY_HEADER = 'Agency Status';            // AD: toll program the car should be on (existing column)
 const TOLLS_ACTION_HEADER = 'Action Required';          // AE (existing column)
 const TOLLS_VERIFY_HEADER = 'Vehicle on Agency Account?'; // AF (added 2026-11-04)
-const TOLLS_VERIFY_VALUES = ['Yes', 'No - needs adding', 'Cannot add - on another account', 'Unknown vehicle', 'Unverified'];
+// "Not in Transponder Index" is NOT proof the car is off the account (Envoy 593 is on E-ZPass but
+// the index is the only roster this script can read), so it asks for a check rather than an add.
+const TOLLS_VERIFY_VALUES = ['Yes', 'Not in Transponder Index', 'Cannot add - on another account', 'Unknown vehicle', 'Unverified'];
 
 // Driver Billing Status values for tolls that are NOT sent to current_tolls.
 const BILLING_STATUS_COLLECTIONS = 'Collections - No Toll Detail';
@@ -372,7 +374,8 @@ function verifyVehicleTollAccount_(envoyNumber, plate, program) {
     return { program: program, status: 'Yes',
              action: `On EZ Pass (transponder ${tag}) yet still violated: check tag is mounted, plate on account, balance funded` };
   }
-  return { program: program, status: 'No - needs adding', action: `Add Envoy ${envoy} (${bare}) to the EZ Pass account` };
+  return { program: program, status: 'Not in Transponder Index',
+           action: `Envoy ${envoy} (${bare}) not in Transponder Index: confirm it is on the EZ Pass account (add it if not, update the index if so); then check tag mounting + plate linked` };
 }
 
 /**
