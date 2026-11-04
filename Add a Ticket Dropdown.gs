@@ -13,6 +13,7 @@ function onOpen() {
     .addItem('Lookup Booking for Selected Row', 'manualBookingLookupForRow')
     .addSeparator()
     .addItem('Export Historical Tolls → CSV', 'exportHistoricalTollsCsv')
+    .addItem('Verify Toll Agency Assignments (Tolls tab)', 'verifyTollAgencyAssignments')
     .addToUi();
   
 }

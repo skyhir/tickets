@@ -704,7 +704,17 @@ const TICKET_EXTRACTION_SCHEMA = (function () {
     originalPenaltyAmount: nullableNumber,
     additionalPenaltyAmount: nullableNumber,
     paymentWebsite: nullableString,
-    dueDate: nullableString
+    dueDate: nullableString,
+    // Added 2026-11-04: collections letters, toll-road location (for PST conversion +
+    // toll-program check), and the agency's own trip id.
+    isCollectionsNotice: { type: "boolean" },
+    // Plain strings ("" = none), not nullable: the API caps a schema at 16 union-typed
+    // fields and the 14 above already use anyOf.
+    collectionAgency: { type: "string" },
+    originalCreditor: { type: "string" },
+    tripId: { type: "string" },
+    tollState: { type: "string" },
+    tollTimeZone: { type: "string" }
   };
   return {
     type: "object",
@@ -748,18 +758,27 @@ Format the output strictly as a JSON object with the following top-level keys:
     - "additionalPenaltyAmount": Any late fees or other penalties explicitly listed FOR THIS specific entry or broadly for the notice if it's late (number, default to 0).
     - "paymentWebsite": If a website URL for payment is provided (string, null if none).
     - "dueDate": The date payment is due (string, format YYYY-MM-DD if easily parsable, otherwise extract as seen, null if none).
+    - "isCollectionsNotice": boolean. TRUE if the document is from a DEBT COLLECTOR / collection agency (e.g. "NCC is a debt collector", "this is an attempt to collect a debt") rather than from the toll authority or city itself. FALSE otherwise.
+    - "collectionAgency": Name of the collection agency when isCollectionsNotice is true (e.g. "NCC"), else "".
+    - "originalCreditor": The toll authority / city the debt is owed to when isCollectionsNotice is true (e.g. "TRANSURBAN (USA) OPERATIONS INC"), else "".
+    - "tripId": The agency's own per-trip / per-transaction ID when one is printed separately from the notice number (string, "" if none).
+    - "tollState": 2-letter US state where the TOLL ROAD or violation location is (NOT the plate state). E.g. I-66 / I-495 / I-95 Express Lanes / Dulles = "VA", FasTrak / Golden Gate = "CA". "" if it cannot be determined.
+    - "tollTimeZone": IANA time zone of the toll road / violation location (e.g. "America/New_York", "America/Los_Angeles"), "" if unknown.
 
 **IMPORTANT**:
 - If the document is a TOLL STATEMENT with multiple toll entries AND/OR fees, create a SEPARATE object in the "violations" array for EACH toll line item and EACH fee line item found. Use the Statement ID or Account number as the 'violationId' if a more specific ID per line isn't available, but ensure amounts reflect individual lines.
 - If only one violation/toll is found, the "violations" array should contain one object.
+- On a violation / late / final notice, per-trip ADMINISTRATION or VIOLATION fees go in "additionalPenaltyAmount" of that trip's entry, not in a separate fee entry. Only notice-level fees that are not tied to a trip (e.g. a mailed statement fee on a toll statement) get their own entry.
+- COLLECTIONS LETTERS: a debt collector's letter for unpaid tolls IS a violation document. Set "isCollectionsNotice": true and "isLateNotice": true, and create one entry per debt / trip line listed, even if it has no time, no location detail or no violation ID: use the travel/trip date as "violationDate" (null "violationTime" if no time is printed), the road listed as "violationLocation", the toll amount as "originalPenaltyAmount", the collector's fees as "additionalPenaltyAmount", the collector's reference number as "violationId", and the collection agency as "issuingAgency". Never return an empty "violations" array for a collections letter that lists an amount owed.
+- Scans are often phone photos with pages rotated sideways. Read dates, times and IDs digit by digit from the trip table itself; do not infer them from the notice date.
 - If NO specific violations or tolls are identifiable in the required structure, return an EMPTY "violations" array, e.g., {"isLateNotice": false, "violations": []}. Do NOT invent data.
 
 Example (Toll Statement):
 {
   "isLateNotice": false,
   "violations": [
-    { "isToll": true, "licensePlate": "KS-D856147", "licenseState": "KS", "violationDate": "03/01/25", "violationTime": "07:10 PM", "violationId": "STMT_28795752_TOLL_1", /*Append _TOLL_# or _FEE_# if needed */ "pinNumber": null, "issuingAgency": "KTA", "agencyShortName": "DRIVEKS", "violationType": "Toll", "violationLocation": "Andover 21st/Wichita K-96", "originalPenaltyAmount": 0.38, "additionalPenaltyAmount": 0, "paymentWebsite": "DriveKS.com", "dueDate": "04/07/2025" },
-    { "isToll": true, "licensePlate": "KS-D856147", "licenseState": "KS", "violationDate": "03/18/25", "violationTime": "12:19 AM", "violationId": "STMT_28795752_FEE_1", "pinNumber": null, "issuingAgency": "KTA", "agencyShortName": "DRIVEKS", "violationType": "Mailed Statement Fee", "violationLocation": null, "originalPenaltyAmount": 1.50, "additionalPenaltyAmount": 0, "paymentWebsite": "DriveKS.com", "dueDate": "04/07/2025" }
+    { "isToll": true, "licensePlate": "KS-D856147", "licenseState": "KS", "violationDate": "03/01/25", "violationTime": "07:10 PM", "violationId": "STMT_28795752_TOLL_1", /*Append _TOLL_# or _FEE_# if needed */ "pinNumber": null, "issuingAgency": "KTA", "agencyShortName": "DRIVEKS", "violationType": "Toll", "violationLocation": "Andover 21st/Wichita K-96", "originalPenaltyAmount": 0.38, "additionalPenaltyAmount": 0, "paymentWebsite": "DriveKS.com", "dueDate": "04/07/2025", "isCollectionsNotice": false, "collectionAgency": "", "originalCreditor": "", "tripId": "", "tollState": "KS", "tollTimeZone": "America/Chicago" },
+    { "isToll": true, "licensePlate": "KS-D856147", "licenseState": "KS", "violationDate": "03/18/25", "violationTime": "12:19 AM", "violationId": "STMT_28795752_FEE_1", "pinNumber": null, "issuingAgency": "KTA", "agencyShortName": "DRIVEKS", "violationType": "Mailed Statement Fee", "violationLocation": null, "originalPenaltyAmount": 1.50, "additionalPenaltyAmount": 0, "paymentWebsite": "DriveKS.com", "dueDate": "04/07/2025", "isCollectionsNotice": false, "collectionAgency": "", "originalCreditor": "", "tripId": "", "tollState": "KS", "tollTimeZone": "America/Chicago" }
   ]
 }
 
@@ -767,7 +786,15 @@ Example (Parking Ticket — non-toll):
 {
   "isLateNotice": false,
   "violations": [
-    { "isToll": false, "licensePlate": "8ABC123", "licenseState": "CA", "violationDate": "02/14/2026", "violationTime": "10:32 AM", "violationId": "SF-12345678", "pinNumber": null, "issuingAgency": "San Francisco Municipal Transportation Agency", "agencyShortName": "SFMTA", "violationType": "Expired Meter", "violationLocation": "100 Market St", "originalPenaltyAmount": 87.00, "additionalPenaltyAmount": 0, "paymentWebsite": "sfmta.com", "dueDate": "03/16/2026" }
+    { "isToll": false, "licensePlate": "8ABC123", "licenseState": "CA", "violationDate": "02/14/2026", "violationTime": "10:32 AM", "violationId": "SF-12345678", "pinNumber": null, "issuingAgency": "San Francisco Municipal Transportation Agency", "agencyShortName": "SFMTA", "violationType": "Expired Meter", "violationLocation": "100 Market St", "originalPenaltyAmount": 87.00, "additionalPenaltyAmount": 0, "paymentWebsite": "sfmta.com", "dueDate": "03/16/2026", "isCollectionsNotice": false, "collectionAgency": "", "originalCreditor": "", "tripId": "", "tollState": "CA", "tollTimeZone": "America/Los_Angeles" }
+  ]
+}
+
+Example (Collections letter for an unpaid toll — no time on the letter):
+{
+  "isLateNotice": true,
+  "violations": [
+    { "isToll": true, "licensePlate": "ABC123", "licenseState": "FL", "violationDate": "05/02/26", "violationTime": null, "violationId": "12345678", "pinNumber": null, "issuingAgency": "NCC", "agencyShortName": "NCC", "violationType": "Unpaid Toll", "violationLocation": "I95", "originalPenaltyAmount": 4.10, "additionalPenaltyAmount": 100.00, "paymentWebsite": "www.payncc.com", "dueDate": null, "isCollectionsNotice": true, "collectionAgency": "NCC", "originalCreditor": "TRANSURBAN (USA) OPERATIONS INC", "tripId": null, "tollState": "VA", "tollTimeZone": "America/New_York" }
   ]
 }`;
 }
@@ -1195,9 +1222,15 @@ function appendAndFormatViolationRow_(violationData, pdfLink, isLateNotice) {
     if (isLateNotice) {
         notesContent += (notesContent ? "; " : "") + "Late Notice";
     }
-    if (isToll) {
-        notesContent += (notesContent ? "; " : "") + "Also routed to toll-processing/current_tolls for admin agency review";
+    if (violationData.isCollectionsNotice === true) {
+        const creditor = violationData.originalCreditor ? ` for ${violationData.originalCreditor}` : '';
+        notesContent += (notesContent ? "; " : "") +
+            `COLLECTIONS NOTICE from ${violationData.collectionAgency || violationData.issuingAgency || 'collector'}${creditor}`;
     }
+    if (violationData.tripId) {
+        notesContent += (notesContent ? "; " : "") + `Trip ID ${violationData.tripId}`;
+    }
+    // The "routed to current_tolls" note is added below once we know whether it was.
     rowData[COL.NOTES - 1] = notesContent;
 
     // --- Due Date Parsing ---
@@ -1219,7 +1252,9 @@ function appendAndFormatViolationRow_(violationData, pdfLink, isLateNotice) {
           const violationDateTimeLocalStr = Utilities.formatDate(parsedDate, Session.getScriptTimeZone(), "yyyy-MM-dd") + " " + Utilities.formatDate(parsedTime, Session.getScriptTimeZone(), "HH:mm:ss");
           logToSheet_(functionName, `Formatted DateTime for DB lookup: ${violationDateTimeLocalStr}`, "DEBUG");
 
-          const dbInfo = getDriverBookingInfo_(vehicleNumber, violationDateTimeLocalStr);
+          // Read the local time in the TOLL ROAD's zone when known (a DC car tolling in
+          // CA would otherwise be compared 3h off in its home property's zone).
+          const dbInfo = getDriverBookingInfo_(vehicleNumber, violationDateTimeLocalStr, isToll ? resolveTollTimeZone_(violationData) : null);
           if (dbInfo && !dbInfo.error) {
             rowData[COL.RESPONSIBLE_DRIVER - 1] = dbInfo.driverName || '';
             rowData[COL.DRIVER_EMAIL - 1] = dbInfo.driverEmail || '';
@@ -1255,7 +1290,7 @@ function appendAndFormatViolationRow_(violationData, pdfLink, isLateNotice) {
     // --- Apply Formatting ---
     // Get range AFTER appending
     const formatRange = sheet.getRange(newRowIndex, 1, 1, Math.min(sheet.getLastColumn(), NUM_COLUMNS));
-    const backgroundColor = isLateNotice ? "#f4cccc" : "#fff2cc";
+    const backgroundColor = (isLateNotice || violationData.isCollectionsNotice === true) ? "#f4cccc" : "#fff2cc";
     formatRange.setBackground(backgroundColor);
     //logToSheet_(functionName, `Set background to ${backgroundColor} (Late: ${isLateNotice}) for row ${newRowIndex}`, "DEBUG"); // Reduced logging noise
 
@@ -1270,35 +1305,58 @@ function appendAndFormatViolationRow_(violationData, pdfLink, isLateNotice) {
     logToSheet_(functionName, `Formatting applied for row ${newRowIndex}`, "DEBUG");
 
     // --- Toll routing: also append to toll-processing/current_tolls ---
+    // Only tolls a driver can be charged for go there (date AND time, a real trip).
+    // Collections letters, date-only tolls and agency-fee lines stay on this tab only
+    // (accounting still pays the agency) and say why in Driver Billing Status + Notes.
     let routedToTolls = false;
+    let routeNote = '';
     if (isToll) {
-        try {
-            routeTollToCurrentTolls_(violationData, parsedDate, parsedTime, {
-                driverName: rowData[COL.RESPONSIBLE_DRIVER - 1] || '',
-                driverEmail: rowData[COL.DRIVER_EMAIL - 1] || '',
-                bookingId: rowData[COL.BOOKING_ID - 1] || ''
-            }, rowData[COL.VEHICLE - 1] || '', pdfLink);
-            routedToTolls = true;
-        } catch (routeErr) {
-            logToSheet_(functionName, `Toll routing to current_tolls failed for Viol ID ${violationData.violationId || 'N/A'}: ${routeErr.toString()}`, "ERROR");
+        const decision = tollRoutingDecision_(violationData, parsedDate, parsedTime);
+        let billingStatus = decision.billingStatus;
+        if (decision.route) {
+            try {
+                const res = routeTollToCurrentTolls_(violationData, parsedDate, parsedTime, {
+                    driverName: rowData[COL.RESPONSIBLE_DRIVER - 1] || '',
+                    driverEmail: rowData[COL.DRIVER_EMAIL - 1] || '',
+                    bookingId: rowData[COL.BOOKING_ID - 1] || ''
+                }, rowData[COL.VEHICLE - 1] || '', pdfLink);
+                routedToTolls = true;
+                routeNote = res.status === 'duplicate'
+                    ? `Already on toll-processing/current_tolls (row ${res.row}); not added twice`
+                    : `Also routed to toll-processing/current_tolls row ${res.row} for admin agency review`;
+            } catch (routeErr) {
+                billingStatus = '';
+                routeNote = 'Toll routing to current_tolls FAILED (see TicketProcessingLogs)';
+                logToSheet_(functionName, `Toll routing to current_tolls failed for Viol ID ${violationData.violationId || 'N/A'}: ${routeErr.toString()}`, "ERROR");
+            }
+        } else {
+            routeNote = `Not sent to current_tolls: ${decision.reason}`;
+            logToSheet_(functionName, `Viol ID ${violationData.violationId || 'N/A'} kept on Tolls tab only: ${decision.reason}`, "INFO");
         }
-    }
 
-    // Mark the tolls-tab row's Driver Billing Status (col P) so reviewers see
-    // at a glance that customer billing is happening via the toll-processing
-    // spreadsheet, not the Stripe-attempt flow on this sheet. Only set when
-    // routing actually succeeded; a failed route leaves col P blank for triage.
-    if (routedToTolls) {
         try {
-            sheet.getRange(newRowIndex, COL.DRIVER_BILLING_STATUS).setValue("Transferred to Toll Sheet");
+            const notesCell = sheet.getRange(newRowIndex, COL.NOTES);
+            notesCell.setValue([rowData[COL.NOTES - 1], routeNote].filter(Boolean).join('; '));
+            // Mark Driver Billing Status (col P) so reviewers see where customer billing
+            // stands. A failed route leaves col P blank for triage.
+            if (billingStatus) sheet.getRange(newRowIndex, COL.DRIVER_BILLING_STATUS).setValue(billingStatus);
         } catch (markErr) {
-            logToSheet_(functionName, `Failed to mark row ${newRowIndex} Driver Billing Status as 'Transferred to Toll Sheet': ${markErr}`, "WARN");
+            logToSheet_(functionName, `Failed to write routing status on row ${newRowIndex}: ${markErr}`, "WARN");
+        }
+
+        // Toll program + "is this car on that account?" (Agency Status / Vehicle on Agency Account? / Action Required).
+        try {
+            const program = resolveTollProgram_(violationData);
+            writeTollAgencyCells_(sheet, newRowIndex,
+                verifyVehicleTollAccount_(rowData[COL.VEHICLE - 1], violationData.licensePlate, program));
+        } catch (agencyErr) {
+            logToSheet_(functionName, `Toll agency check failed on row ${newRowIndex}: ${agencyErr}`, "WARN");
         }
     }
 
     // --- New-row email notification (never blocks row append) ---
     try {
-        notifyNewRow_(isToll, violationData, rowData[COL.VEHICLE - 1] || '', newRowIndex, pdfLink, routedToTolls);
+        notifyNewRow_(isToll, violationData, rowData[COL.VEHICLE - 1] || '', newRowIndex, pdfLink, routedToTolls, routeNote);
     } catch (mailErr) {
         logToSheet_(functionName, `Email notification failed for Viol ID ${violationData.violationId || 'N/A'}: ${mailErr.toString()}`, "WARN");
     }
@@ -1337,85 +1395,10 @@ function calculateTollAdminFee_(tollAmount) {
     return 0.50;
 }
 
-/**
- * Append a row to toll-processing!current_tolls representing a toll that
- * arrived via the ticket-PDF uploader. Customer reimbursement (base toll +
- * admin fee) will run through the existing Stripe flow on that sheet; the
- * tickets-sheet row continues to cover the agency payment via accounting.
- */
-function routeTollToCurrentTolls_(violationData, parsedDate, parsedTime, dbInfo, vehicleNumber, pdfLink) {
-    const functionName = "routeTollToCurrentTolls_";
-    const ss = SpreadsheetApp.openById(TOLL_PROCESSING_SHEET_ID);
-    if (!ss) throw new Error(`Could not open toll-processing spreadsheet ${TOLL_PROCESSING_SHEET_ID}`);
-    const sheet = ss.getSheetByName(TOLL_CURRENT_SHEET_NAME);
-    if (!sheet) throw new Error(`Sheet "${TOLL_CURRENT_SHEET_NAME}" not found in toll-processing spreadsheet`);
-
-    const tz = Session.getScriptTimeZone();
-    let firstName = '', lastName = '';
-    if (dbInfo && dbInfo.driverName) {
-        const parts = String(dbInfo.driverName).trim().split(/\s+/);
-        firstName = parts.shift() || '';
-        lastName  = parts.join(' ');
-    }
-
-    let dateTimeLocalStr = '';
-    if (parsedDate && parsedTime) {
-        dateTimeLocalStr = Utilities.formatDate(parsedDate, tz, "yyyy-MM-dd") + " " + Utilities.formatDate(parsedTime, tz, "HH:mm:ss");
-    } else if (parsedDate) {
-        dateTimeLocalStr = Utilities.formatDate(parsedDate, tz, "yyyy-MM-dd");
-    } else {
-        dateTimeLocalStr = [violationData.violationDate, violationData.violationTime].filter(Boolean).join(' ');
-    }
-
-    const tollAmount = parseFloat(violationData.originalPenaltyAmount) || 0;
-    const adminFee   = calculateTollAdminFee_(tollAmount);
-    const totalDue   = Math.round((tollAmount + adminFee) * 100) / 100;
-    const penaltyAmt = parseFloat(violationData.additionalPenaltyAmount) || 0;
-
-    const note = [
-        'From ticket PDF',
-        `violationId=${violationData.violationId || 'N/A'}`,
-        `agency=${violationData.issuingAgency || 'N/A'}`,
-        `plate=${violationData.licensePlate || 'N/A'}`,
-        penaltyAmt > 0 ? `penalty_billed_accounting=$${penaltyAmt.toFixed(2)}` : null,
-        pdfLink ? `PDF=${pdfLink}` : null
-    ].filter(Boolean).join(' · ');
-
-    const row = [
-        firstName,                                 // A First Name
-        lastName,                                  // B Last Name
-        (dbInfo && dbInfo.driverEmail) || '',      // C User Email
-        vehicleNumber || '',                       // D Envoy #
-        (dbInfo && dbInfo.bookingId) || '',        // E Booking ID
-        dateTimeLocalStr,                          // F Time and Date (Local)
-        violationData.violationType || '',         // G Type
-        tollAmount,                                // H Toll Amount
-        adminFee,                                  // I Admin Fee
-        totalDue,                                  // J Total Due
-        '',                                        // K Confirmed?
-        '',                                        // L Charged?
-        '',                                        // M Notified?
-        '',                                        // N Booking Toll Total
-        '',                                        // O (blank)
-        '',                                        // P Booking Sum (from H)
-        '',                                        // Q Booking Sum (from I)
-        '',                                        // R Booking GL String
-        note,                                      // S Ticket Source Note
-        'YES'                                      // T Needs Agency Review
-    ];
-
-    sheet.appendRow(row);
-    const newIdx = sheet.getLastRow();
-    try {
-        sheet.getRange(newIdx, 8, 1, 3).setNumberFormat("$#,##0.00"); // H, I, J currency
-    } catch (fmtErr) {
-        logToSheet_(functionName, `Currency format failed on routed toll row ${newIdx}: ${fmtErr}`, "DEBUG");
-    }
-    logToSheet_(functionName, `Appended toll to current_tolls row ${newIdx} (plate ${violationData.licensePlate}, amount $${tollAmount.toFixed(2)})`, "SUCCESS");
-}
+// routeTollToCurrentTolls_ lives in TollRouting.gs (header-driven, processed_tolls layout).
 
 /** Per-row email notification to NEW_ROW_NOTIFY_EMAIL with subject "new toll" / "new ticket". */
-function notifyNewRow_(isToll, violationData, vehicleNumber, newRowIndex, pdfLink, routedToTolls) {
+function notifyNewRow_(isToll, violationData, vehicleNumber, newRowIndex, pdfLink, routedToTolls, routeNote) {
     if (!NEW_ROW_NOTIFY_EMAIL) return;
     const plate  = violationData.licensePlate || 'N/A';
     const state  = violationData.licenseState || '';
@@ -1448,7 +1431,7 @@ function notifyNewRow_(isToll, violationData, vehicleNumber, newRowIndex, pdfLin
         pdfLink ? `<p><a href="${pdfLink}">PDF</a></p>` : '',
         rowUrl  ? `<p><a href="${rowUrl}">Open row in tickets sheet</a></p>` : '',
         isToll
-            ? `<p>Also routed to toll-processing <i>current_tolls</i>: ${routedToTolls ? 'yes' : 'NO — see logs'}</p>`
+            ? `<p>toll-processing <i>current_tolls</i>: ${routedToTolls ? 'yes' : 'no'}${routeNote ? ' — ' + routeNote : ''}</p>`
             : ''
     ];
     const htmlBody = lines.filter(Boolean).join('\n');
@@ -1542,21 +1525,6 @@ function exportHistoricalTollsCsv() {
     ui.alert(`Historical tolls export complete.\n\n${tollRows.length} rows of ${body.length} scanned.\nCSV: ${fileName}\n\nEmailed to ${NEW_ROW_NOTIFY_EMAIL} and saved to your Drive root.`);
 }
 
-/**
- * One-time setup: ensure current_tolls has headers for columns S and T.
- * Run manually from the Apps Script editor after first deploy. Idempotent.
- */
-function seedCurrentTollsHeaders_() {
-    const ss = SpreadsheetApp.openById(TOLL_PROCESSING_SHEET_ID);
-    const sheet = ss.getSheetByName(TOLL_CURRENT_SHEET_NAME);
-    if (!sheet) throw new Error(`Sheet "${TOLL_CURRENT_SHEET_NAME}" not found`);
-    const hdrRange = sheet.getRange(1, 19, 1, 2); // S1:T1
-    const existing = hdrRange.getValues()[0];
-    if (existing[0] !== 'Ticket Source Note' || existing[1] !== 'Needs Agency Review') {
-        hdrRange.setValues([['Ticket Source Note', 'Needs Agency Review']]).setFontWeight('bold');
-    }
-}
-
 /** Helper to format values as plain text for sheet to avoid auto-formatting issues */
 function formatValueForSheet_(value) {
   if (value === null || value === undefined) return '';
@@ -1597,7 +1565,10 @@ function canonicalizePlateForFuzzy_(plate) {
     .replace(/S/g, '5')
     .replace(/B/g, '8')
     .replace(/Z/g, '2')
-    .replace(/G/g, '6');
+    .replace(/G/g, '6')
+    // E<->3: NCC letter 55016720 read fleet plate 72EGUC (Envoy 593) as "723GUC".
+    // Measured 2026-11-04 on the 773 fleet plates: adds no new ambiguous pair.
+    .replace(/E/g, '3');
 }
 
 // Placeholder text that appears in the fleet sheet's plate columns. Never treat
@@ -1796,9 +1767,10 @@ function shiftDateOnly_(ymd, days) {
  * Handles timezone conversion.
  * @param {string} vehicleNumber The vehicle number (e.g., "636").
  * @param {string} violationDateTimeLocalStr The violation date and time as a string ("YYYY-MM-DD HH:MM" or "YYYY-MM-DD HH:MM:SS") in the *local* timezone of the violation.
+ * @param {string} [violationTzId] IANA zone the local time is in (the toll road's). Defaults to the booking property's zone.
  * @returns {object} { driverName: string, driverEmail: string, bookingId: string, propertyName: string, error: string|null }
  */
-function getDriverBookingInfo_(vehicleNumber, violationDateTimeLocalStr) {
+function getDriverBookingInfo_(vehicleNumber, violationDateTimeLocalStr, violationTzId) {
   const functionName = "getDriverBookingInfo_";
   if (!vehicleNumber || !violationDateTimeLocalStr) {
     logToSheet_(functionName, "Missing vehicleNumber or violationDateTimeLocalStr for DB lookup.", "WARN");
@@ -1905,7 +1877,8 @@ function getDriverBookingInfo_(vehicleNumber, violationDateTimeLocalStr) {
          closeQuietly_(propStmt);
        }
 
-       if (!propertyTzId) continue;
+       const parseTzId = violationTzId || propertyTzId;
+       if (!parseTzId) continue;
 
        // --- Timezone Conversion & Comparison ---
        try {
@@ -1914,8 +1887,8 @@ function getDriverBookingInfo_(vehicleNumber, violationDateTimeLocalStr) {
          if (violationDateTimeLocalStr.match(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/)) {
             violationDateFormat = "yyyy-MM-dd HH:mm:ss"; // Use HH:mm:ss if seconds are present
          }
-         logToSheet_(functionName, `Parsing local violation time '${violationDateTimeLocalStr}' using TZ: '${propertyTzId}' and format: '${violationDateFormat}'`, "DEBUG");
-         const violationDateObj = Utilities.parseDate(violationDateTimeLocalStr, propertyTzId, violationDateFormat);
+         logToSheet_(functionName, `Parsing local violation time '${violationDateTimeLocalStr}' using TZ: '${parseTzId}'${violationTzId ? ' (toll road)' : ' (property)'} and format: '${violationDateFormat}'`, "DEBUG");
+         const violationDateObj = Utilities.parseDate(violationDateTimeLocalStr, parseTzId, violationDateFormat);
          const violationTimestamp = violationDateObj.getTime();
          logToSheet_(functionName, `Absolute violation timestamp (ms): ${violationTimestamp}`, "DEBUG");
 
