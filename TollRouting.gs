@@ -300,7 +300,8 @@ function routeTollToCurrentTolls_(violationData, parsedDate, parsedTime, dbInfo,
   const target = sheet.getLastRow() + 1;
   if (target > sheet.getMaxRows()) sheet.insertRowsAfter(sheet.getMaxRows(), target - sheet.getMaxRows());
   // Text-format the id/date/time cells first so Sheets doesn't turn "08/10/2026" into a date serial.
-  [CT_HEADERS_.ENVOY, CT_HEADERS_.BOOKING, CT_HEADERS_.DATE_PST, CT_HEADERS_.TIME_PST, CT_HEADERS_.LOCAL].forEach(function (h) {
+  // Time (PST) is left to parse as a time-of-day value, as the toll pipeline's own rows are.
+  [CT_HEADERS_.ENVOY, CT_HEADERS_.BOOKING, CT_HEADERS_.DATE_PST, CT_HEADERS_.LOCAL].forEach(function (h) {
     const i = headerIdx_(hm, h);
     if (i !== -1) sheet.getRange(target, i + 1).setNumberFormat('@');
   });
@@ -309,6 +310,8 @@ function routeTollToCurrentTolls_(violationData, parsedDate, parsedTime, dbInfo,
     const i = headerIdx_(hm, h);
     if (i !== -1) sheet.getRange(target, i + 1).setNumberFormat('$#,##0.00');
   });
+  const iTimePst = headerIdx_(hm, CT_HEADERS_.TIME_PST);
+  if (iTimePst !== -1 && timePst) sheet.getRange(target, iTimePst + 1).setNumberFormat('h:mm am/pm');
   SpreadsheetApp.flush();
   logToSheet_(functionName, `Appended toll to current_tolls row ${target} (Envoy # ${envoyValue}, local ${localDisplay}, PST ${datePst} ${timePst}, $${tollAmount.toFixed(2)})`, 'SUCCESS');
   return { status: 'appended', row: target };
