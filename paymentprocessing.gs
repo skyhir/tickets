@@ -181,9 +181,18 @@ function resolvePaidTimestampCol_(sheet) {
     logToSheet_(functionName, `Header scan failed on "${sheet.getName()}": ${e}. Falling back to index ${COL.PAID_TIMESTAMP}.`, "WARN");
   }
 
+  // Fall back to the default index ONLY if that column has no header of its own.
+  // On "Envoy Violations - Tolls 2026" column AD is "Agency Status", and the old
+  // unconditional fallback would have stamped paid times over it.
   if (COL.PAID_TIMESTAMP <= maxCols) {
-    logToSheet_(functionName, `No "${PAID_TIMESTAMP_HEADER}" header on "${sheet.getName()}"; falling back to column ${COL.PAID_TIMESTAMP}.`, "WARN");
-    return COL.PAID_TIMESTAMP;
+    let headerThere = '';
+    try { headerThere = String(sheet.getRange(1, COL.PAID_TIMESTAMP).getDisplayValue() || '').trim(); } catch (e) { headerThere = '?'; }
+    if (!headerThere) {
+      logToSheet_(functionName, `No "${PAID_TIMESTAMP_HEADER}" header on "${sheet.getName()}"; falling back to empty column ${COL.PAID_TIMESTAMP}.`, "WARN");
+      return COL.PAID_TIMESTAMP;
+    }
+    logToSheet_(functionName, `No "${PAID_TIMESTAMP_HEADER}" header on "${sheet.getName()}" and column ${COL.PAID_TIMESTAMP} is "${headerThere}"; not stamping paid time.`, "WARN");
+    return null;
   }
 
   logToSheet_(functionName, `"${sheet.getName()}" has no "${PAID_TIMESTAMP_HEADER}" column and only ${maxCols} columns. Paid timestamps will not be recorded for this tab.`, "WARN");

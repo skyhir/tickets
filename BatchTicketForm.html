@@ -188,6 +188,20 @@
           <input type="number" step="0.01" id="additionalPenalty" name="additionalPenalty" oninput="markOverridden(this)">
         </div>
       </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label for="tripId">Agency Trip ID (if separate from notice #):</label>
+          <input type="text" id="tripId" name="tripId" oninput="markOverridden(this)">
+        </div>
+        <div class="form-group">
+          <label for="tollState">Toll road state (e.g. VA — not the plate state):</label>
+          <input type="text" id="tollState" name="tollState" maxlength="2" oninput="markOverridden(this)">
+        </div>
+      </div>
+      <label style="display:flex; align-items:center; gap:8px; font-weight:normal;">
+        <input type="checkbox" id="isCollectionsNotice" name="isCollectionsNotice" onchange="markOverridden(this)" style="width:auto;">
+        Collections notice (debt collector letter). Filed on the Tolls tab for accounting; NOT sent to current_tolls, since there is no toll time to find the driver.
+      </label>
       <label for="notes">Notes (Website for payment, etc.) (T*):</label>
       <textarea id="notes" name="notes" oninput="markOverridden(this)"></textarea>
       <label for="dueDate">Due date (if available) (U*):</label>
@@ -781,8 +795,10 @@ const fieldIdToOcrKeyMap = {
     issuingAgency: 'issuingAgency', violationType: 'violationType',
     violationLocation: 'violationLocation', originalPenalty: 'originalPenaltyAmount',
     additionalPenalty: 'additionalPenaltyAmount', notes: 'paymentWebsite',
-    dueDate: 'dueDate'
+    dueDate: 'dueDate', tripId: 'tripId', tollState: 'tollState'
 };
+// Checkbox fields (boolean OCR keys), handled separately from the text fields above.
+const checkboxFieldIdToOcrKeyMap = { isCollectionsNotice: 'isCollectionsNotice' };
 
 function populateFormForActivePdfViolation(index) {
   // ... (your existing function content)
@@ -808,6 +824,13 @@ function populateFormForActivePdfViolation(index) {
       }
       field.value = valueToSet;
       if (valueToSet !== '') field.classList.add('auto-detected');
+    }
+  }
+  for (const fieldId in checkboxFieldIdToOcrKeyMap) {
+    const box = q(`#${fieldId}`);
+    if (box) {
+      box.checked = violationData[checkboxFieldIdToOcrKeyMap[fieldId]] === true;
+      if (box.checked) box.parentElement.classList.add('auto-detected');
     }
   }
 }
@@ -842,6 +865,10 @@ function updateModifiedViolationDataFromForm(indexToUpdate) {
         if (field) {
             currentViolationBeingModified[ocrKey] = field.value;
         }
+    }
+    for (const fieldId in checkboxFieldIdToOcrKeyMap) {
+        const box = q(`#${fieldId}`);
+        if (box) currentViolationBeingModified[checkboxFieldIdToOcrKeyMap[fieldId]] = box.checked;
     }
 }
 
