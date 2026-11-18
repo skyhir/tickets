@@ -140,6 +140,10 @@
         </div>
       </div>
 
+      <div id="manualEntryNoticeInForm" style="display:none; background-color:#eff6ff; border:1px solid #93c5fd; color:#1e3a8a; padding:10px; margin-bottom:10px; border-radius:4px; text-align:center; font-size:0.875rem;">
+        OCR found no violations in this document. Enter the details from the PDF by hand, then submit.
+      </div>
+
       <div id="ocrOverrideWarningInForm">Heads up! You've manually changed some auto-detected values.</div>
 
       <div class="form-row">
@@ -541,8 +545,18 @@ function submitAllReviewedTickets() {
   }
 
   const packagesToSubmit = [];
+  const skippedNames = [];
   allUploadedFileResults.forEach(item => {
     if (item.success && !item.submitted) {
+      // A file OCR found nothing in, and nobody has typed details into yet,
+      // has nothing to file. Leave it in the queue rather than sending an
+      // empty package (the server rejects it, and one failure stops every
+      // card in the batch from being marked submitted).
+      const vs = item.modifiedOcrData.violations || [];
+      if (vs.length === 0 || vs.some(isBlankViolation_)) {
+        skippedNames.push(item.name);
+        return;
+      }
       packagesToSubmit.push({
         ticketPDF: item.fileUrl,
         ticketFileId: item.fileId,
@@ -552,10 +566,14 @@ function submitAllReviewedTickets() {
     }
   });
 
+  const skippedNote = skippedNames.length
+    ? ` Skipped ${skippedNames.length} with no violation details yet (open and fill in by hand): ${skippedNames.join(', ')}.`
+    : '';
+
   if (packagesToSubmit.length === 0) {
     if(q('#batchSubmitStatus')) {
-      q('#batchSubmitStatus').textContent = 'No new tickets to submit.';
-      q('#batchSubmitStatus').style.color = '#6b7280';
+      q('#batchSubmitStatus').textContent = 'No new tickets to submit.' + skippedNote;
+      q('#batchSubmitStatus').style.color = skippedNames.length ? '#ef4444' : '#6b7280';
     }
     return;
   }
@@ -574,8 +592,8 @@ function submitAllReviewedTickets() {
   google.script.run
     .withSuccessHandler(response => {
       if(batchStatusDiv) {
-        batchStatusDiv.textContent = response.summary || "Batch submission complete.";
-        batchStatusDiv.style.color = response.failures > 0 ? '#ef4444' : '#16a34a';
+        batchStatusDiv.textContent = (response.summary || "Batch submission complete.") + skippedNote;
+        batchStatusDiv.style.color = (response.failures > 0 || skippedNames.length) ? '#ef4444' : '#16a34a';
       }
       if(submitBtn) {
         submitBtn.innerHTML = '<i class="fas fa-tasks"></i> Submit All Reviewed to Sheet';
@@ -728,12 +746,14 @@ function buildFormForActivePdf() {
   q('#activePdfIsLateNoticeField').value = activePdfIsLateNotice;
   activePdfCurrentViolationDisplayIndex = 0;
 
-  if (activePdfModifiedViolationsData.length > 0) {
-    populateFormForActivePdfViolation(activePdfCurrentViolationDisplayIndex);
-  } else {
-    q('#formPaneContainer form').innerHTML = '<p style="text-align:center; padding:20px;">No violations found in this document by OCR.</p>';
-    return;
+  // OCR can come back empty (unusual layouts, evidence packets, poor scans).
+  // Don't dead-end the reviewer: give them one blank violation to fill in by
+  // hand. The server accepts hand-typed violations the same as OCR'd ones.
+  if (activePdfModifiedViolationsData.length === 0) {
+    activePdfModifiedViolationsData.push(blankViolation_());
+    q('#manualEntryNoticeInForm').style.display = 'block';
   }
+  populateFormForActivePdfViolation(activePdfCurrentViolationDisplayIndex);
 
   if (activePdfModifiedViolationsData.length > 1) {
     q('#multiViolationInfoInForm').style.display = 'block';
@@ -799,6 +819,25 @@ const fieldIdToOcrKeyMap = {
 };
 // Checkbox fields (boolean OCR keys), handled separately from the text fields above.
 const checkboxFieldIdToOcrKeyMap = { isCollectionsNotice: 'isCollectionsNotice' };
+
+// An empty violation for manual entry when OCR found none. isToll is left
+// unset on purpose: the server's classifyIsToll_ then infers ticket vs toll
+// from the agency / type / website the reviewer types.
+function blankViolation_() {
+  const v = {};
+  for (const fieldId in fieldIdToOcrKeyMap) v[fieldIdToOcrKeyMap[fieldId]] = '';
+  for (const fieldId in checkboxFieldIdToOcrKeyMap) v[checkboxFieldIdToOcrKeyMap[fieldId]] = false;
+  return v;
+}
+
+// True when nothing has been typed into any text field of this violation.
+function isBlankViolation_(v) {
+  if (!v) return true;
+  return Object.values(fieldIdToOcrKeyMap).every(key => {
+    const val = v[key];
+    return val === undefined || val === null || String(val).trim() === '';
+  });
+}
 
 function populateFormForActivePdfViolation(index) {
   // ... (your existing function content)
@@ -890,7 +929,16 @@ function submitActiveTicketData() {
   statusDiv.style.color = "#3b82f6";
 
   updateModifiedViolationDataFromForm(activePdfCurrentViolationDisplayIndex);
-  
+
+  // Guard against filing an empty row from an untouched manual-entry form.
+  if (activePdfModifiedViolationsData.length === 0 || activePdfModifiedViolationsData.some(isBlankViolation_)) {
+    statusDiv.textContent = "Fill in the violation details from the PDF before submitting.";
+    statusDiv.style.color = "#ef4444";
+    submitBtn.disabled = false;
+    submitBtn.innerHTML = '<i class="fas fa-check-circle"></i> Submit This Ticket to Sheet';
+    return;
+  }
+
   const dataPackage = {
     ticketPDF: activePdfFileUrl,
     ticketFileId: activePdfFileId,
