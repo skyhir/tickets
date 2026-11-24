@@ -236,10 +236,21 @@ function logToSheet_(functionName, message, level) {
 // ====================================================================
 
 function showAddTicketForm() {
-  var html = HtmlService.createHtmlOutputFromFile('AddTicketForm')
+  // A template (not createHtmlOutputFromFile) so it can pull in UploadHelpers.html.
+  var html = HtmlService.createTemplateFromFile('AddTicketForm').evaluate()
       .setWidth(600) // Wider for more fields
       .setHeight(750);
   SpreadsheetApp.getUi().showModalDialog(html, 'Add Parking/Traffic Ticket');
+}
+
+/**
+ * Inlines another project HTML file into a templated dialog:
+ *   <?!= includeHtmlFile('UploadHelpers'); ?>
+ * @param {string} filename project HTML file name, without .html
+ * @returns {string}
+ */
+function includeHtmlFile(filename) {
+  return HtmlService.createHtmlOutputFromFile(filename).getContent();
 }
 
 // ====================================================================
@@ -681,6 +692,11 @@ function saveRotatedTicketPdf(fileId, base64Data) {
 // ====================================================================
 
 const TICKET_GEMINI_MODEL = "gemini-2.5-flash";
+// Biggest PDF worth sending to the AI. Claude caps a request at 32 MB and base64
+// adds a third, so ~24 MB of PDF is the ceiling; 20 MB leaves room. The upload
+// dialogs already shrink scans to 10 MB (UploadHelpers.html), so this only
+// catches a caller that skips that, with a clear message instead of a crash.
+const TICKET_AI_MAX_PDF_BYTES = 20 * 1024 * 1024;
 // Multi-violation toll statements can list dozens of line items; thinking
 // shares this budget. stop_reason "max_tokens" falls back to Gemini.
 const TICKET_CLAUDE_MAX_TOKENS = 16000;
@@ -916,8 +932,13 @@ function analyzeTicketWithGemini_(fileId) {
         logToSheet_(functionName, `File is not a PDF. MimeType: ${blob.getContentType()}`, "ERROR");
         throw new Error(`Invalid file type. Expected PDF, got ${blob.getContentType()}`);
     }
-    const base64Data = Utilities.base64Encode(blob.getBytes());
-    logToSheet_(functionName, `File Name: ${file.getName()}, Size: ${blob.getBytes().length} bytes.`, "DEBUG");
+    const bytes = blob.getBytes();
+    logToSheet_(functionName, `File Name: ${file.getName()}, Size: ${bytes.length} bytes.`, "DEBUG");
+    if (bytes.length > TICKET_AI_MAX_PDF_BYTES) {
+      const mb = (n) => (n / (1024 * 1024)).toFixed(1) + " MB";
+      throw new Error(`PDF is ${mb(bytes.length)}; the AI reader takes up to ${mb(TICKET_AI_MAX_PDF_BYTES)}. Re-scan it at a lower quality or split it into smaller PDFs.`);
+    }
+    const base64Data = Utilities.base64Encode(bytes);
 
     const ai = aiWithFallback_({
       label: `${functionName}(${fileId})`,

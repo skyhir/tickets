@@ -104,6 +104,22 @@ const geminiOk = (obj) => ({ status: 200, body: { candidates: [{ finishReason: '
   assert.ok(/failure=http_400/.test(r.message) && /bad schema/.test(r.message), r.message);
 }
 
+// A PDF over the AI size limit (e.g. a 43 MB phone scan) is refused with a
+// clear message before any API call, instead of a request the API rejects.
+{
+  const C = sandbox({ ANTHROPIC_API_KEY: 'k', GEMINI_API_KEY: 'g' });
+  const big = { length: 43 * 1024 * 1024 };
+  C.DriveApp.getFileById = () => ({
+    getName: () => 'SMTA Customer Service Center.pdf',
+    getBlob: () => ({ getContentType: () => 'application/pdf', getBytes: () => big })
+  });
+  C.Utilities.base64Encode = () => { throw new Error('should not encode an oversized PDF'); };
+  const r = C.analyzeTicketWithGemini_('fileBig');
+  assert.strictEqual(r.success, false);
+  assert.ok(/PDF is 43\.0 MB; the AI reader takes up to 20\.0 MB/.test(r.message), r.message);
+  assert.strictEqual(C.calls.length, 0);
+}
+
 // Schema keys == the prompt's documented keys, every object closed.
 {
   const C = sandbox({});

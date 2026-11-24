@@ -3,18 +3,8 @@
 <head>
   <base target="_top" />
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
-  <!-- pdf-lib: client-side PDF rotation for correcting upside-down scans before filing. -->
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js"></script>
-  <!-- pdf.js: renders the rotated preview to a <canvas>. The Apps Script dialog
-       sandbox blocks blob:/data: PDFs in an <iframe>, so we can't preview rotated
-       bytes through the Drive iframe; canvas rendering works inside the sandbox. -->
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
-  <script>
-    if (window.pdfjsLib) {
-      pdfjsLib.GlobalWorkerOptions.workerSrc =
-        'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
-    }
-  </script>
+  <!-- pdf-lib + pdf.js (rotation, rotated preview, shrinking big scans) and upload helpers. -->
+  <?!= includeHtmlFile('UploadHelpers'); ?>
   <style>
     body { font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif; margin: 0; padding: 0; display: flex; height: 100vh; background-color: #f0f2f5; }
     #queue { width: 300px; min-width:250px; max-width:400px; height: 100vh; border-right: 1px solid #d1d5db; background-color: #f9fafb; overflow-y: auto; padding: 10px; display: flex; flex-direction: column; box-sizing: border-box; }
@@ -370,67 +360,95 @@ window.onload = function() {
 // or inside if that was the original structure, but ensure they are accessible.
 // Based on your provided full HTML, they are global functions, so they should remain outside window.onload.
 
+// Each file goes to the server in its own call, a few at a time. Sending the
+// whole selection in one call made one request carry every PDF (a few phone
+// scans were enough to break it), let one bad file fail them all, and put a
+// big batch at risk of Apps Script's 6-minute limit. Per-file calls also let
+// each card finish as soon as its own file is done.
+const UPLOAD_CONCURRENCY = 3;
+const uploadQueue = [];
+let uploadsInFlight = 0;
+
 function uploadAndProcessBatch(files) {
   console.log("uploadAndProcessBatch called with files:", files);
   dropHint.classList.add('hidden');
   // NB: do NOT reset cards / results / active state here. Files dropped during
   // an in-flight batch must append to the queue, not erase prior work.
 
-  // Allocate a stable, unique originalIndex per file in this batch. Each card's
-  // DOM id is `card-${originalIndex}` so the global counter prevents collisions
-  // when batches overlap.
-  const batchOriginalIndices = files.map(file => {
+  // Allocate a stable, unique originalIndex per file. Each card's DOM id is
+  // `card-${originalIndex}` so the global counter prevents collisions when
+  // batches overlap.
+  files.forEach(file => {
     const originalIndex = nextOriginalIndex++;
     addCard(originalIndex, file.name, 'state-pending', 'Queued for upload...');
-    return originalIndex;
+    uploadQueue.push({ file, originalIndex });
+  });
+  pumpUploadQueue_();
+}
+
+function pumpUploadQueue_() {
+  while (uploadsInFlight < UPLOAD_CONCURRENCY && uploadQueue.length > 0) {
+    const job = uploadQueue.shift();
+    uploadsInFlight++;
+    uploadOneTicket_(job.file, job.originalIndex)
+      .catch(e => console.error('Unexpected upload error for', job.file.name, e))
+      .finally(() => {
+        uploadsInFlight--;
+        pumpUploadQueue_();
+      });
+  }
+}
+
+// Shrinks the PDF if it's too big (UploadHelpers.html), uploads + analyzes it,
+// and records the result on its card. Never rejects; failures land on the card.
+async function uploadOneTicket_(file, originalIndex) {
+  // Record a failure like any other result, so clicking the card shows why.
+  const fail = message => appendBatchResults([originalIndex], {
+    results: [{ index: 0, name: file.name, success: false, message }]
   });
 
-  const fileDataPromises = files.map((file, idxInBatch) => {
-    const originalIndex = batchOriginalIndices[idxInBatch];
-    return new Promise(resolve => {
-      const reader = new FileReader();
-      reader.onload = e_reader => resolve({ name: file.name, data: e_reader.target.result.split(',')[1], mimeType: file.type, originalIndex: originalIndex });
-      reader.onerror = () => {
-        updateCardStatus(originalIndex, 'state-error', `Error reading file: ${file.name}`);
-        resolve({ name: file.name, error: true, originalIndex: originalIndex, message: 'File read error' });
-      };
-      reader.readAsDataURL(file);
-    });
-  });
+  let prepared;
+  try {
+    updateCardStatus(originalIndex, 'state-processing', 'Reading file...');
+    prepared = await prepareTicketPdfForUpload(file,
+      text => updateCardStatus(originalIndex, 'state-processing', text));
+  } catch (e) {
+    fail((e && e.message) || 'Could not read this file.');
+    return;
+  }
 
-  Promise.all(fileDataPromises).then(fileDataArray => {
-    const validFilesToProcess = fileDataArray.filter(fd => !fd.error);
-    if (validFilesToProcess.length === 0) {
-        console.log("No valid files to upload to server.");
-        return;
-    }
+  updateCardStatus(originalIndex, 'state-processing', prepared.shrunk
+    ? `Uploading & Analyzing (scan shrunk ${formatMb_(prepared.originalBytes)} → ${formatMb_(prepared.bytes)})...`
+    : 'Uploading & Analyzing...');
 
-    validFilesToProcess.forEach(fd => {
-        updateCardStatus(fd.originalIndex, 'state-processing', 'Uploading & Analyzing...');
-    });
+  // Stash the uploaded PDF bytes so the rotate feature can re-encode locally
+  // without a round-trip to Drive. Picked up in appendBatchResults.
+  pdfBytesByIndex[originalIndex] = prepared.base64;
 
-    // Server returns res.index as a per-call 0-based position. Capture this
-    // batch's originalIndex array so the success handler can translate
-    // res.index back to the right card without colliding with concurrent batches.
-    const validOriginalIndicesByPos = validFilesToProcess.map(fd => fd.originalIndex);
-
-    // Stash the uploaded PDF bytes so the rotate feature can re-encode locally
-    // without a round-trip to Drive. Picked up in appendBatchResults.
-    validFilesToProcess.forEach(fd => { pdfBytesByIndex[fd.originalIndex] = fd.data; });
-
+  await new Promise(resolve => {
     google.script.run
-      .withSuccessHandler(summary => appendBatchResults(validOriginalIndicesByPos, summary))
-      .withFailureHandler(err => {
-        console.error("Batch Upload/Analysis Error:", err);
-        validFilesToProcess.forEach(fd => {
-            const card = q(`#card-${fd.originalIndex}`);
-            if (card && card.querySelector('.status-text.state-processing')) {
-                 updateCardStatus(fd.originalIndex, 'state-error', `Batch processing error: ${err.message}`);
-            }
-        });
-        alert(`Batch processing failed: ${err.message}`);
+      .withSuccessHandler(summary => {
+        try {
+          if (summary && Array.isArray(summary.results) && summary.results.length > 0) {
+            appendBatchResults([originalIndex], summary);
+          } else {
+            delete pdfBytesByIndex[originalIndex];
+            fail('The server sent back no result for this file. Try uploading it again.');
+          }
+        } finally {
+          resolve();
+        }
       })
-      .uploadAndAnalyzeTicketsBatch(validFilesToProcess.map(fd => ({name: fd.name, data: fd.data, mimeType: fd.mimeType })));
+      .withFailureHandler(err => {
+        console.error("Upload/Analysis Error for", file.name, err);
+        delete pdfBytesByIndex[originalIndex];
+        try {
+          fail(`Upload failed: ${serverErrorText_(err)}`);
+        } finally {
+          resolve();
+        }
+      })
+      .uploadAndAnalyzeTicketsBatch([{ name: file.name, data: prepared.base64, mimeType: file.type }]);
   });
 }
 
@@ -626,7 +644,7 @@ function submitAllReviewedTickets() {
     .withFailureHandler(error => {
       console.error("Batch Submission Error:", error);
       if(batchStatusDiv) {
-        batchStatusDiv.textContent = "Error during batch submission: " + error.message;
+        batchStatusDiv.textContent = "Error during batch submission: " + serverErrorText_(error);
         batchStatusDiv.style.color = '#ef4444';
       }
       if(submitBtn) {
@@ -990,7 +1008,7 @@ function submitActiveTicketData() {
     })
     .withFailureHandler(error => {
       console.error("Submission Error:", error);
-      statusDiv.textContent = "Error: " + error.message;
+      statusDiv.textContent = "Error: " + serverErrorText_(error);
       statusDiv.style.color = "#ef4444";
       submitBtn.disabled = false;
       submitBtn.innerHTML = '<i class="fas fa-exclamation-triangle"></i> Retry Submission';
@@ -1139,7 +1157,7 @@ async function rotateActivePdf(deltaDegrees) {
         setRotateButtonsDisabled(false);
         console.error('saveRotatedTicketPdf failed:', err);
         if (myGen === activationGeneration) {
-          setRotateStatus('Rotated, but Drive save failed: ' + err.message, '#ef4444');
+          setRotateStatus('Rotated, but Drive save failed: ' + serverErrorText_(err), '#ef4444');
         }
       })
       .saveRotatedTicketPdf(resultData.fileId, rotatedB64);
