@@ -1,7 +1,8 @@
 
 // --- END OF BATCH-AWARE LOGGING SYSTEM ---
 function showBatchTicketForm() {
-  const html = HtmlService.createHtmlOutputFromFile('BatchTicketForm')
+  // A template (not createHtmlOutputFromFile) so it can pull in UploadHelpers.html.
+  const html = HtmlService.createTemplateFromFile('BatchTicketForm').evaluate()
       .setWidth(1200)
       .setHeight(800);
   SpreadsheetApp.getUi().showModalDialog(html, 'Batch PDF Upload & Review');

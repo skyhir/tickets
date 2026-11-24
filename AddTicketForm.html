@@ -3,6 +3,8 @@
 <head>
   <base target="_top">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+  <!-- Shrinks big phone scans before upload; readable server error text. -->
+  <?!= includeHtmlFile('UploadHelpers'); ?>
   <style>
     body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; padding: 15px; background-color: #f9f9f9; }
     h2 { color: #333; border-bottom: 2px solid #eee; padding-bottom: 5px; }
@@ -512,9 +514,13 @@
       updateProgressBar('progressUpload', 'active', 'Uploading Ticket...'); // CALLS the function
       uploadStatus.textContent = "Starting upload...";
 
-      var reader = new FileReader();
-      reader.onload = function(e) {
-        var base64Data = e.target.result.split(',')[1];
+      // Big phone scans are shrunk in the browser first (UploadHelpers.html).
+      prepareTicketPdfForUpload(file, function(text) { uploadStatus.textContent = text; })
+        .then(function(prepared) {
+        var base64Data = prepared.base64;
+        if (prepared.shrunk) {
+          uploadStatus.textContent = "Large scan shrunk from " + formatMb_(prepared.originalBytes) + " to " + formatMb_(prepared.bytes) + ". Uploading...";
+        }
         var fileData = { name: file.name, mimeType: file.type, data: base64Data };
 
         // --- Call Server: Upload and Analyze ---
@@ -586,21 +592,20 @@
             updateProgressBar('progressUpload', 'error', 'Server Error');
             updateProgressBar('progressAnalyze', 'error', 'Not Started');
             updateProgressBar('progressPopulate', 'error', 'Not Started');
-            statusDiv.textContent = "Server Error: " + error.message;
+            statusDiv.textContent = "Server Error: " + serverErrorText_(error);
             statusDiv.style.color = "#a50e0e";
              submitBtn.disabled = true; // Ensure submit is disabled on error
           })
           .uploadAndAnalyzeTicket(fileData); // Call the backend function
-      };
-      reader.onerror = function(err) {
-        console.error("File Read Error:", err);
-        updateProgressBar('progressUpload', 'error', 'File Read Error');
-        uploadStatus.textContent = "Error reading file: " + err;
+      }, function(err) {
+        // Unreadable file, or too big even after shrinking: the message says what to do.
+        console.error("File Prep Error:", err);
+        updateProgressBar('progressUpload', 'error', 'File Error');
+        uploadStatus.textContent = "Error: " + ((err && err.message) || "Could not read this file.");
         uploadStatus.style.color = "#a50e0e";
         progressBarContainer.style.display = "none";
          submitBtn.disabled = true; // Ensure submit is disabled on error
-      };
-      reader.readAsDataURL(file);
+      });
     }
 
 
@@ -686,7 +691,7 @@
          })
          .withFailureHandler(function(error) {
            console.error("Submission Error:", error);
-           statusDiv.textContent = "Error submitting data: " + error.message;
+           statusDiv.textContent = "Error submitting data: " + serverErrorText_(error);
            statusDiv.style.color = "#a50e0e";
            submitBtn.disabled = false;
            submitBtn.innerHTML = 'Submit Ticket Data';

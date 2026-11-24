@@ -1,0 +1,147 @@
+<!--
+  Shared by the ticket upload dialogs (AddTicketForm, BatchTicketForm), which
+  inline it server-side via includeHtmlFile() in TicketProcessing.gs. Loads
+  pdf-lib and pdf.js, and defines prepareTicketPdfForUpload() and
+  serverErrorText_().
+
+  Why: phone scans are huge. An iPhone "Scan Documents" page is ~6 MB, so a
+  7-page notice is 43 MB, ~57 MB once base64'd for google.script.run. A request
+  that size dies before any of our server code runs, so the dialog only ever
+  saw "undefined". Even if it got through, Claude takes 32 MB per request and
+  Gemini 20 MB. So any PDF over PDF_UPLOAD_MAX_BYTES is redrawn here, page by
+  page, as JPEG at a still-readable resolution (43 MB -> a few MB) before it
+  is sent.
+-->
+<!-- pdf-lib: builds the shrunk PDF, and rotates upside-down scans (batch form). -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js"></script>
+<!-- pdf.js: renders pages for shrinking, and the rotated preview (batch form). The
+     Apps Script dialog sandbox blocks blob:/data: PDFs in an <iframe>, so we can't
+     preview rotated bytes through the Drive iframe; canvas rendering works. -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
+<script>
+  if (window.pdfjsLib) {
+    pdfjsLib.GlobalWorkerOptions.workerSrc =
+      'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
+  }
+
+  // Largest PDF we send to the server. 10 MB is ~13 MB once base64'd: inside
+  // Gemini's 20 MB inline limit (the fallback) and Claude's 32 MB, and quick to
+  // upload. Anything bigger is shrunk to fit.
+  const PDF_UPLOAD_MAX_BYTES = 10 * 1024 * 1024;
+  // Tried in order until the PDF fits: long edge of each page in pixels, and
+  // JPEG quality. 2000 px on a letter page is ~180 DPI, so fine print and
+  // plate numbers stay readable for both the reviewer and the AI.
+  const PDF_SHRINK_PASSES = [
+    { maxEdgePx: 2000, quality: 0.72 },
+    { maxEdgePx: 1600, quality: 0.6 },
+    { maxEdgePx: 1200, quality: 0.5 }
+  ];
+
+  /**
+   * Gets a PDF File ready to send to the server.
+   * Returns { base64, bytes, originalBytes, shrunk }. Files at or under
+   * PDF_UPLOAD_MAX_BYTES are sent untouched (text layer intact); bigger ones are
+   * re-rendered smaller. Throws an Error whose message tells the reviewer what to
+   * do when the file can't be made to fit.
+   * @param {File} file
+   * @param {function(string)=} onStatus receives progress text for the UI
+   */
+  async function prepareTicketPdfForUpload(file, onStatus) {
+    if (file.size <= PDF_UPLOAD_MAX_BYTES) {
+      return { base64: await blobToBase64_(file), bytes: file.size, originalBytes: file.size, shrunk: false };
+    }
+    if (typeof pdfjsLib === 'undefined' || typeof PDFLib === 'undefined') {
+      throw new Error(`This PDF is ${formatMb_(file.size)}, over the ${formatMb_(PDF_UPLOAD_MAX_BYTES)} limit, and the tools to shrink it didn't load. Close this window, reopen it and try again.`);
+    }
+
+    const original = new Uint8Array(await file.arrayBuffer());
+    let smallest = null;
+    try {
+      for (const pass of PDF_SHRINK_PASSES) {
+        const out = await rasterizePdf_(original, pass, (n, total) => {
+          if (onStatus) onStatus(`Shrinking ${formatMb_(file.size)} scan: page ${n} of ${total}...`);
+        });
+        if (!smallest || out.length < smallest.length) smallest = out;
+        if (out.length <= PDF_UPLOAD_MAX_BYTES) break;
+      }
+    } catch (e) {
+      console.error('PDF shrink failed:', e);
+      throw new Error(`This PDF is ${formatMb_(file.size)}, over the ${formatMb_(PDF_UPLOAD_MAX_BYTES)} limit, and couldn't be shrunk (${(e && e.message) || e}). Re-scan it at a lower quality, or split it into smaller PDFs.`);
+    }
+    if (smallest.length > PDF_UPLOAD_MAX_BYTES) {
+      throw new Error(`This PDF is ${formatMb_(file.size)} and still ${formatMb_(smallest.length)} after shrinking (limit ${formatMb_(PDF_UPLOAD_MAX_BYTES)}). Split it into smaller PDFs and upload those.`);
+    }
+    return {
+      base64: await blobToBase64_(new Blob([smallest], { type: 'application/pdf' })),
+      bytes: smallest.length,
+      originalBytes: file.size,
+      shrunk: true
+    };
+  }
+
+  // Draws every page to a canvas and rebuilds the PDF from JPEGs of those
+  // canvases. Each page keeps its original size in points; only the pixel
+  // density behind it changes. pdf.js applies any /Rotate, so the output pages
+  // are upright as displayed.
+  async function rasterizePdf_(srcBytes, pass, onPage) {
+    // pdf.js takes ownership of (detaches) the buffer it is given: pass a copy so
+    // a later, smaller pass can reuse the original bytes.
+    const src = await pdfjsLib.getDocument({ data: srcBytes.slice() }).promise;
+    try {
+      const out = await PDFLib.PDFDocument.create();
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      for (let n = 1; n <= src.numPages; n++) {
+        if (onPage) onPage(n, src.numPages);
+        const page = await src.getPage(n);
+        const size = page.getViewport({ scale: 1 }); // PDF points, rotation applied
+        // Cap the long edge, and never upsample past ~200 DPI on small pages.
+        const scale = Math.min(pass.maxEdgePx / Math.max(size.width, size.height), 200 / 72);
+        const viewport = page.getViewport({ scale });
+        canvas.width = Math.max(1, Math.round(viewport.width));
+        canvas.height = Math.max(1, Math.round(viewport.height));
+        ctx.fillStyle = '#ffffff'; // JPEG has no transparency
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        await page.render({ canvasContext: ctx, viewport }).promise;
+        const jpg = await out.embedJpg(await canvasToJpegBytes_(canvas, pass.quality));
+        out.addPage([size.width, size.height])
+          .drawImage(jpg, { x: 0, y: 0, width: size.width, height: size.height });
+        page.cleanup();
+      }
+      canvas.width = canvas.height = 0; // release the bitmap now, not at GC
+      return await out.save();
+    } finally {
+      src.destroy();
+    }
+  }
+
+  function canvasToJpegBytes_(canvas, quality) {
+    return new Promise((resolve, reject) => {
+      canvas.toBlob(blob => {
+        if (!blob) { reject(new Error('could not encode a page image')); return; }
+        blob.arrayBuffer().then(buf => resolve(new Uint8Array(buf)), reject);
+      }, 'image/jpeg', quality);
+    });
+  }
+
+  function blobToBase64_(blob) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result).split(',')[1] || '');
+      reader.onerror = () => reject(new Error(`Could not read the file (${(reader.error && reader.error.message) || 'unknown error'}).`));
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  function formatMb_(bytes) {
+    return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+  }
+
+  // google.script.run failure handlers get an Error, a bare string, or nothing
+  // useful (dropped connection, oversized request). Never show "undefined".
+  function serverErrorText_(err) {
+    if (err && err.message) return err.message;
+    if (typeof err === 'string' && err.trim()) return err;
+    return 'No response from the server (the connection dropped or the upload was too large). Try again; if it keeps failing, send the PDF to the tech team.';
+  }
+</script>
